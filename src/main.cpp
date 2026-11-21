@@ -912,8 +912,7 @@ static void write_campaign_daily(const vector<i64>& cs, const vector<i64>& cps, 
 }
 
 
-// Links -> a flat table split into NLP equal sub-tables by the top LB bits of
-// the key's hash. Each linked ID maps to its person's name.
+// The links build groups IDs into NLP parts by the top LB bits of the key's hash.
 static const int LB = 10, NLP = 1 << LB;
 // Huge-page backed, zero-filled array (fresh anonymous memory is already zero).
 template <class T>
@@ -926,30 +925,39 @@ static T* huge_zeroed(size_t n) {
     madvise(a, bytes, MADV_HUGEPAGE);
     return (T*)a;
 }
-struct KVArr {
-    KV* p = nullptr;
-    size_t n = 0;
-    KV* data() const { return p; }
+// Linked ID -> person name: buckets of 4 full keys and their 4 values in one
+// 64-byte line, looked up with one AVX2 compare and a branch-free select. A key
+// is stored in its home bucket (top LMB_BITS of its hash) or, if that is full,
+// in the next bucket with room; LMB_OVF[b] marks buckets that something
+// overflowed past, so a miss there keeps probing (rare).
+struct alignas(64) LBucket {
+    u64 k[4];
+    u64 v[4];
 };
-static KVArr LMF;
-static u64 LSUB_MASK;
-static int LSUB_BITS;
-static inline size_t lm_base(u64 h) { return (size_t)(h >> (64 - LB)) << LSUB_BITS; }
-static inline u64 person_of(u64 k) {
-    u64 h = mix64(k);
-    const KV* t = LMF.data() + lm_base(h);
-    u64 s = h & LSUB_MASK;
+static LBucket* LMB;
+static u8* LMB_OVF;
+static int LMB_BITS = 1;
+static inline u64 lmb_home(u64 h) { return h >> (64 - LMB_BITS); }
+__attribute__((noinline)) static u64 person_slow(u64 k, u64 b) {
+    const u64 mask = ((u64)1 << LMB_BITS) - 1;
     for (;;) {
-        const KV& e = t[s];
-        if (e.k == k) return e.v;
-        if (!e.k) return k;
-        s = (s + 1) & LSUB_MASK;
+        const LBucket& B = LMB[b];
+        for (int i = 0; i < 4; i++)
+            if (B.k[i] == k) return B.v[i];
+        if (!LMB_OVF[b]) return k;
+        b = (b + 1) & mask;
     }
 }
-static inline void person_prefetch(u64 k) {
-    u64 h = mix64(k);
-    __builtin_prefetch(LMF.data() + lm_base(h) + (h & LSUB_MASK));
+static inline u64 person_of(u64 k) {
+    const u64 b = lmb_home(mix64(k));
+    const LBucket& B = LMB[b];
+    const __m256i kk = _mm256_load_si256((const __m256i*)B.k);
+    const u32 m = (u32)_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(kk, _mm256_set1_epi64x((long long)k))));
+    const u64 v = B.v[__builtin_ctz(m | 16) & 3];
+    if (__builtin_expect(!m && LMB_OVF[b], 0)) return person_slow(k, (b + 1) & (((u64)1 << LMB_BITS) - 1));
+    return m ? v : k;
 }
+static inline void person_prefetch(u64 k) { __builtin_prefetch(LMB + lmb_home(mix64(k))); }
 
 #ifdef SS_PROF
 static atomic<u64> PROFC[8];
@@ -1533,7 +1541,11 @@ struct Thr {
     vector<i32> ses, evs;
     vector<i64> rev;
     vector<i16> top;
-    vector<i64> cs, cps, crev, cas;
+    struct CCell {  // per (campaign, day): sessions, purchasing sessions, revenue
+        i64 s, ps, rev;
+    };
+    vector<CCell> cc;
+    vector<i64> cas;
     vector<int> cnt, pos, active;
     vector<i64> catsum;
     vector<int> touched;
@@ -1764,9 +1776,7 @@ static void run() {
     // ---- pass 3: per person partition -------------------------------------------------
     for (auto& t : th) {
         size_t cells = (size_t)NCAMP * NDAYS;
-        t.cs.assign(cells, 0);
-        t.cps.assign(cells, 0);
-        t.crev.assign(cells, 0);
+        t.cc.assign(cells, Thr::CCell{0, 0, 0});
         t.cas.assign(cells, 0);
         t.cnt.assign(NCAMP, 0);
         t.pos.assign(NCAMP, 0);
@@ -2079,9 +2089,10 @@ static void run() {
                     }
                     u32 credited = hi > lo ? C[hi - 1].camp : 0;
                     size_t cell = (size_t)credited * NDAYS + day;
-                    T.cs[cell] += 1;
-                    T.cps[cell] += purch;
-                    T.crev[cell] += rev;
+                    Thr::CCell& cl = T.cc[cell];
+                    cl.s += 1;
+                    cl.ps += purch;
+                    cl.rev += rev;
                     for (int c : T.active) T.cas[(size_t)c * NDAYS + day] += 1;
                     s = e;
                 }
@@ -2153,9 +2164,9 @@ static void run() {
         vector<i64> cs(cells, 0), cps(cells, 0), crev(cells, 0), cas(cells, 0);
         for (auto& t : th)
             for (size_t x = 0; x < cells; x++) {
-                cs[x] += t.cs[x];
-                cps[x] += t.cps[x];
-                crev[x] += t.crev[x];
+                cs[x] += t.cc[x].s;
+                cps[x] += t.cc[x].ps;
+                crev[x] += t.cc[x].rev;
                 cas[x] += t.cas[x];
             }
         write_campaign_daily(cs, cps, crev, cas);
@@ -2165,13 +2176,13 @@ static void run() {
 
 }  // namespace fast
 
-// Links -> LMF, single-threaded and cache-friendly:
+// Links -> LMB (linked ID -> person name), single-threaded and cache-friendly:
 //  1. parse every link line into a flat pair array (AVX2 line scan, SIMD keys)
 //  2. counting-sort pair slots by sub-table (top LB bits of the key hash)
 //  3. per sub-table, a small L1/L2-sized table dedupes keys and assigns dense
 //     ids, written straight back into the pair array (no second lookup)
-//  4. LMF sub-tables are filled sub-table by sub-table (contiguous memory)
 //  5. union-find over the dense ids, then each id's person = smallest key
+//  6. LMB filled in id order (ids are grouped by hash prefix, so writes stay local)
 static void build_links() {
     vector<u64> A;  // A[2j], A[2j+1]: the two keys of link j
     A.reserve(LK_BYTES / 9 + 16);
@@ -2243,22 +2254,7 @@ static void build_links() {
     }
     dbase[NLP] = (u32)keys.size();
     const u32 N = (u32)keys.size();
-    // 4. LMF: sub-tables of 2^LSUB_BITS slots, at most half full
-    LSUB_BITS = 4;
-    while (((size_t)1 << LSUB_BITS) < (size_t)maxd * 2) LSUB_BITS++;
-    LSUB_MASK = ((u64)1 << LSUB_BITS) - 1;
-    LMF.n = (size_t)NLP << LSUB_BITS;
-    LMF.p = huge_zeroed<KV>(LMF.n);
-    vector<u32> slot(N);
-    for (u32 id = 0; id < N; id++) {
-        const u64 k = keys[id];
-        const u64 h = mix64(k);
-        KV* t = LMF.p + lm_base(h);
-        u64 s = h & LSUB_MASK;
-        while (t[s].k) s = (s + 1) & LSUB_MASK;
-        t[s].k = k;
-        slot[id] = (u32)((t + s) - LMF.p);
-    }
+    (void)maxd;
     // 5. union-find (path halving; the smaller id becomes the root)
     vector<u32> par(N);
     for (u32 i = 0; i < N; i++) par[i] = i;
@@ -2283,7 +2279,28 @@ static void build_links() {
         par[i] = r;
         if (r != i && key_less(keys[i], nm[r])) nm[r] = keys[i];
     }
-    for (u32 i = 0; i < N; i++) LMF.p[slot[i]].v = nm[par[i]];
+    // 6. the lookup table: about 1/3 full (4 slots per bucket)
+    LMB_BITS = 1;
+    while (((size_t)4 << LMB_BITS) < (size_t)N * 3) LMB_BITS++;
+    const u64 nb = (u64)1 << LMB_BITS, bmask = nb - 1;
+    LMB = huge_zeroed<LBucket>(nb);
+    LMB_OVF = huge_zeroed<u8>(nb);
+    for (u32 i = 0; i < N; i++) {  // ids are grouped by hash prefix: bucket writes stay local
+        const u64 k = keys[i];
+        u64 b = lmb_home(mix64(k));
+        for (;;) {
+            LBucket& B = LMB[b];
+            int f = 0;
+            while (f < 4 && B.k[f]) f++;
+            if (f < 4) {
+                B.k[f] = k;
+                B.v[f] = nm[par[i]];
+                break;
+            }
+            LMB_OVF[b] = 1;
+            b = (b + 1) & bmask;
+        }
+    }
 }
 
 // SS_SELFTEST=1: differential tests of the fast helpers against the plain ones.
