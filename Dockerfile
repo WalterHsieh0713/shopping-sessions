@@ -16,7 +16,9 @@ ARG CXXFLAGS="-O3 -std=c++17 -static -pthread -fno-stack-protector"
 RUN clang++ $CXXFLAGS -march=x86-64-v4 -o /pipeline-v4 main.cpp && \
     clang++ $CXXFLAGS -march=x86-64-v3 -DSS_DISPATCH_TO='"/app/pipeline-v4"' -o /pipeline main.cpp
 
-FROM debian:bookworm-slim
+# The binaries are static, so the runtime image is empty apart from them
+# (faster container start than a distribution base image).
+FROM scratch
 COPY --from=build /pipeline /pipeline-v4 /app/
 WORKDIR /app
 CMD ["/app/pipeline"]
