@@ -166,6 +166,15 @@ static inline u64 key_find(const char* p, size_t n) {
     if (short_code(p, n, k)) return k;
     return pool_find(p, n);
 }
+// key_find with the SIMD short-code path when 16 bytes are readable at p
+static inline u64 key_find_fast(const char* p, u32 n, const char* bufend) {
+    u64 k;
+    if (__builtin_expect(p + 16 <= bufend, 1)) {
+        if (short_code_simd(p, n, k)) return k;
+        return pool_find(p, n);
+    }
+    return key_find(p, n);
+}
 static string key_str(u64 k) {
     if (k & POOLBIT) {
         lock_guard<mutex> g(pool_mu);
@@ -1462,7 +1471,7 @@ __attribute__((always_inline)) static inline size_t scan_line(const char* p, con
 }
 // Fields [fs, fe) from comma positions; strips quotes; false if malformed.
 template <int NF>
-static inline bool fields(const char* p, size_t len, const u32* cp, int nc, int nq, u32* fs, u32* fe) {
+__attribute__((always_inline)) static inline bool fields(const char* p, size_t len, const u32* cp, int nc, int nq, u32* fs, u32* fe) {
     if (nc != NF - 1) return false;
     fs[0] = 0;
     for (int i = 0; i < NF - 1; i++) fe[i] = cp[i], fs[i + 1] = cp[i] + 1;
@@ -1552,7 +1561,7 @@ static void run() {
         t.se.init(NPE, &t.slab, 512);
         static_assert(sizeof(EvRec) * 512 == sizeof(PRec) * 1024, "recycled event blocks must fit person blocks");
         t.sc.init(NPP, &t.slab, 256);
-        t.craw.init(1, &t.slab, 8192);
+        t.craw.init(1, &t.slab, 256);  // same block size as sc: raw blocks are recycled into sc
         t.sp.init(NPP, &t.slab, 1024);
     }
     // ---- links build on their own thread, overlapped with the parse -------------
@@ -1615,7 +1624,7 @@ static void run() {
                         r.user = key_of_fast(p + fs[1], l1, bufend);
                         r.ts = (u32)(ts - CBASE);
                         if (type == 2) {
-                            u64 pk = key_find(p + fs[5], fe[5] - fs[5]);
+                            u64 pk = key_find_fast(p + fs[5], fe[5] - fs[5], bufend);
                             const KV* pe = pk ? PRODUCTS.get(pk) : nullptr;
                             u32 cat = (u32)(pe ? pe->v : (u64)UNKNOWN_CAT);
                             r.aux = price | (cat << 24);
@@ -1634,7 +1643,7 @@ static void run() {
                     if (!l0 || !l1 || !l2) return;
                     i64 ts;
                     if (!parse_ts_fast(p + fs[3], fe[3] - fs[3], ts) || ts < CBASE || ts >= WE) return;
-                    u64 ck = key_find(p + fs[2], l2);
+                    u64 ck = key_find_fast(p + fs[2], l2, bufend);
                     const KV* ce = ck ? CAMPAIGNS.get(ck) : nullptr;
                     if (!ce) return;
                     CRec c;
@@ -1666,7 +1675,8 @@ static void run() {
                 // clicks parsed by thread `task`: resolve persons (prefetched), scatter
                 Scatter<CRec>& sc = th[tid].sc;
                 const int sh = 64 - PP_BITS;
-                for (Blk* b = th[task].craw.head[0]; b; b = b->next) {
+                for (Blk* b = th[task].craw.head[0]; b;) {
+                    Blk* const nb = b->next;
                     CRec* c = bdata<CRec>(b);
                     const u32 n = b->n;
                     const u32 D = 16;
@@ -1677,6 +1687,8 @@ static void run() {
                         x.person = person_of(x.person);
                         sc.push((int)(mix64(x.person) >> sh), x);
                     }
+                    sc.free_blocks.push_back(b);  // read: reuse it for resolved clicks
+                    b = nb;
                 }
                 return;
             }
@@ -2359,6 +2371,14 @@ static int selftest() {
 }
 
 int main(int argc, char** argv) {
+    // glibc malloc on transparent huge pages (fewer page faults for the large
+    // vectors). Tunables are read at process start, so set it and re-exec once
+    // (or let the exec of the AVX-512 build below carry it).
+    bool reexec = false;
+    if (!getenv("GLIBC_TUNABLES") && !getenv("SS_NO_TUNE")) {
+        setenv("GLIBC_TUNABLES", "glibc.malloc.hugetlb=1", 1);
+        reexec = true;
+    }
 #ifdef SS_DISPATCH_TO
     // This build targets x86-64-v3 (AVX2). If the CPU has everything x86-64-v4
     // needs (AVX-512 F/BW/CD/DQ/VL), hand over to the AVX-512 build. If that
@@ -2369,6 +2389,7 @@ int main(int argc, char** argv) {
         __builtin_cpu_supports("avx512vl"))
         execv(SS_DISPATCH_TO, argv);
 #endif
+    if (reexec) execv("/proc/self/exe", argv);  // if this fails, run without the tunable
     T0 = chrono::steady_clock::now();
     DBG = getenv("SS_DEBUG") != nullptr;
     init_codes();
