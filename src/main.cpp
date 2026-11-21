@@ -872,6 +872,25 @@ static void load_inputs(const string& DATA) {
     EVF = map_all(DATA + "/events", EV_BYTES);
     CLF = map_all(DATA + "/clicks", CL_BYTES);
     LKF = map_all(DATA + "/links", LK_BYTES);
+    // If the inputs are not in the page cache, the parse would stall on one page
+    // fault at a time per thread. A helper thread asks the kernel to read every
+    // file ahead (links first, then events and clicks in parse-task order), so
+    // the disk queue stays full while the parse runs.
+    if (!getenv("SS_NO_RA"))
+        thread([] {
+            // A chunk whose first 64 KB are resident is taken as cached and skipped,
+            // so a warm run pays almost nothing.
+            const size_t step = (size_t)8 << 20;
+            unsigned char vec[16];
+            for (auto* v : {&LKF, &EVF, &CLF})
+                for (auto& m : *v)
+                    for (size_t o = 0; o < m.n; o += step) {
+                        const size_t len = min(step, m.n - o), probe = min(len, (size_t)16 << 12);
+                        bool cached = mincore((void*)(m.p + o), probe, vec) == 0;
+                        for (size_t q = 0; cached && q < (probe + 4095) / 4096; q++) cached = vec[q] & 1;
+                        if (!cached) madvise((void*)(m.p + o), len, MADV_WILLNEED);
+                    }
+        }).detach();
 }
 
 static void write_campaign_daily(const vector<i64>& cs, const vector<i64>& cps, const vector<i64>& crev,
