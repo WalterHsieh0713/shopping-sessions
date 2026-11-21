@@ -670,9 +670,88 @@ struct ColData {
     int conv;     // -1 none, 0 UTF8, 6 DATE
     int logical;  // 0 none, 1 STRING, 6 DATE
     string page;
+    int enc = 0;  // 0 PLAIN, 5 DELTA_BINARY_PACKED, 7 DELTA_BYTE_ARRAY
 };
 static void put32(string& s, u32 v) { s.append((const char*)&v, 4); }
 
+// ---- Parquet DELTA_BINARY_PACKED / DELTA_BYTE_ARRAY encoders ----------------
+// DELTA_BINARY_PACKED: header <block size 128> <4 miniblocks> <count> <first
+// value (zigzag)>, then per block <min delta (zigzag)> <4 bit widths> and the
+// miniblocks of 32 (delta - min delta) values bit-packed LSB first. A partial
+// last block keeps all 4 width bytes; unneeded miniblocks have width 0 and no
+// body; the last used miniblock is padded to 32 values with zeros.
+static void put_uleb(string& s, u64 v) {
+    while (v >= 0x80) s.push_back((char)(v | 0x80)), v >>= 7;
+    s.push_back((char)v);
+}
+static inline u64 zigzag(i64 v) { return ((u64)v << 1) ^ (u64)(v >> 63); }
+static void delta_binary_packed(string& s, const i64* v, size_t n) {
+    put_uleb(s, 128);
+    put_uleb(s, 4);
+    put_uleb(s, n);
+    put_uleb(s, zigzag(n ? v[0] : 0));
+    u64 d[128];
+    for (size_t b = 1; b < n; b += 128) {
+        const size_t m = min<size_t>(128, n - b);
+        i64 mn = INT64_MAX;
+        for (size_t i = 0; i < m; i++) {
+            const i64 x = (i64)((u64)v[b + i] - (u64)v[b + i - 1]);
+            d[i] = (u64)x;
+            mn = min(mn, x);
+        }
+        put_uleb(s, zigzag(mn));
+        for (size_t i = 0; i < m; i++) d[i] -= (u64)mn;
+        for (size_t i = m; i < 128; i++) d[i] = 0;
+        const size_t nmb = (m + 31) / 32;
+        u8 w[4] = {0, 0, 0, 0};
+        for (size_t k = 0; k < nmb; k++) {
+            u64 o = 0;
+            for (size_t i = 0; i < 32; i++) o |= d[k * 32 + i];
+            w[k] = (u8)(o ? 64 - __builtin_clzll(o) : 0);
+        }
+        s.append((const char*)w, 4);
+        for (size_t k = 0; k < nmb; k++) {
+            const int bw = w[k];
+            if (!bw) continue;
+            // 32 values of bw bits = 4 * bw bytes
+            u64 acc = 0;
+            int nb = 0;
+            for (size_t i = 0; i < 32; i++) {
+                const u64 x = d[k * 32 + i];
+                acc |= x << nb;
+                const int room = 64 - nb;
+                if (bw >= room) {
+                    s.append((const char*)&acc, 8);
+                    acc = room < 64 ? x >> room : 0;
+                    nb = bw - room;
+                } else
+                    nb += bw;
+            }
+            if (nb) s.append((const char*)&acc, (size_t)(nb + 7) / 8);
+        }
+    }
+}
+// DELTA_BYTE_ARRAY: prefix lengths shared with the previous value (DELTA_BINARY_PACKED),
+// then the suffixes as DELTA_LENGTH_BYTE_ARRAY (lengths DELTA_BINARY_PACKED, then bytes).
+static void delta_byte_array(string& s, const vector<string>& vals) {
+    const size_t n = vals.size();
+    vector<i64> pre(n), len(n);
+    string bytes;
+    for (size_t i = 0; i < n; i++) {
+        size_t p = 0;
+        if (i) {
+            const string &a = vals[i - 1], &b = vals[i];
+            const size_t lim = min(a.size(), b.size());
+            while (p < lim && a[p] == b[p]) p++;
+        }
+        pre[i] = (i64)p;
+        len[i] = (i64)(vals[i].size() - p);
+        bytes.append(vals[i], p, string::npos);
+    }
+    delta_binary_packed(s, pre.data(), n);
+    delta_binary_packed(s, len.data(), n);
+    s += bytes;
+}
 static void write_parquet(const string& path, i64 nrows, const vector<ColData>& cols) {
     // The file is "PAR1", per column a page header and its page, then the
     // footer; written with writev straight from the page buffers.
@@ -688,7 +767,7 @@ static void write_parquet(const string& path, i64 nrows, const vector<ColData>& 
             h.fi32(3, (i64)c.page.size());
             h.fstruct(5);
             h.fi32(1, nrows);
-            h.fi32(2, 0);
+            h.fi32(2, c.enc);
             h.fi32(3, 3);
             h.fi32(4, 3);
             h.send();
@@ -734,11 +813,11 @@ static void write_parquet(const string& path, i64 nrows, const vector<ColData>& 
             f.fi32(1, c.ptype);
             if (c.optional) {
                 f.flist(2, 5, 2);
-                f.zz(0);
+                f.zz(c.enc);
                 f.zz(3);
             } else {
                 f.flist(2, 5, 1);
-                f.zz(0);
+                f.zz(c.enc);
             }
             f.flist(3, 8, 1);
             f.uv(c.name.size());
@@ -2201,17 +2280,27 @@ static void run() {
             size_t n = T.uid.size();
             if (n == 0 && !(ti == 0 && total_rows == 0)) return;
             vector<ColData> cols(6);
-            cols[0] = {"user_id", PT_BYTES, false, 0, 1, ""};
-            cols[0].page.reserve(n * 14);
-            for (size_t r = 0; r < n; r++) put_key(cols[0].page, T.uid[r]);
-            cols[1] = {"day", PT_INT32, false, 6, 6, ""};
-            cols[1].page.append((const char*)T.day.data(), n * 4);
-            cols[2] = {"sessions", PT_INT32, false, -1, 0, ""};
-            cols[2].page.append((const char*)T.ses.data(), n * 4);
-            cols[3] = {"events", PT_INT32, false, -1, 0, ""};
-            cols[3].page.append((const char*)T.evs.data(), n * 4);
-            cols[4] = {"revenue_cents", PT_INT64, false, -1, 0, ""};
-            cols[4].page.append((const char*)T.rev.data(), n * 8);
+            // delta encodings: rows come grouped by person in day order, so
+            // user_id repeats and day, sessions, events have small deltas
+            cols[0] = {"user_id", PT_BYTES, false, 0, 1, "", 7};
+            {
+                vector<string> ids(n);
+                for (size_t r = 0; r < n; r++) ids[r] = key_str(T.uid[r]);
+                delta_byte_array(cols[0].page, ids);
+            }
+            vector<i64> tmp(n);
+            auto delta_col = [&](ColData& c, auto* src) {
+                for (size_t r = 0; r < n; r++) tmp[r] = (i64)src[r];
+                delta_binary_packed(c.page, tmp.data(), n);
+            };
+            cols[1] = {"day", PT_INT32, false, 6, 6, "", 5};
+            delta_col(cols[1], T.day.data());
+            cols[2] = {"sessions", PT_INT32, false, -1, 0, "", 5};
+            delta_col(cols[2], T.ses.data());
+            cols[3] = {"events", PT_INT32, false, -1, 0, "", 5};
+            delta_col(cols[3], T.evs.data());
+            cols[4] = {"revenue_cents", PT_INT64, false, -1, 0, "", 5};
+            delta_col(cols[4], T.rev.data());
             cols[5] = {"top_category", PT_BYTES, true, 0, 1, ""};
             vector<u8> def(n);
             for (size_t r = 0; r < n; r++) def[r] = T.top[r] >= 0;
