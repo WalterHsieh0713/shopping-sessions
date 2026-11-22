@@ -23,9 +23,9 @@
 #include <vector>
 
 #include <dirent.h>
+#include <sched.h>
 #include <fcntl.h>
 #include <immintrin.h>
-#include <sched.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -61,68 +61,21 @@ static void die(const char* msg) {
     exit(1);
 }
 
+// One multiply: the high half is well mixed (partitions take the top bits),
+// and folding it into the low half mixes the low bits (tables mask them).
 static inline u64 mix64(u64 x) {
-    x ^= x >> 31;
-    x *= 0x7fb5d329728ea185ULL;
-    x ^= x >> 27;
-    x *= 0x81dadef4bc2dd44dULL;
-    x ^= x >> 33;
-    return x;
+    x *= 0x9E3779B97F4A7C15ULL;
+    return x ^ (x >> 32);
 }
 
 // Thread count for par_for; a thread may override it (the links thread runs
 // its own par_for calls serially while the parse workers run).
 static thread_local int PAR_NT = 0;
-// Worker tid runs on PIN[tid % size]: one CPU per physical core first, then the
-// hyperthread siblings (from /sys topology). Empty = no pinning.
-static vector<int> PIN;
-static void init_pinning() {
-    if (getenv("SS_NO_PIN")) return;
-    cpu_set_t cs;
-    CPU_ZERO(&cs);
-    if (sched_getaffinity(0, sizeof cs, &cs) != 0) return;
-    vector<pair<pair<int, int>, int>> cpus;  // ((package, core), cpu)
-    for (int c = 0; c < CPU_SETSIZE; c++) {
-        if (!CPU_ISSET(c, &cs)) continue;
-        char path[96];
-        int pkg = -1, core = -1;
-        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", c);
-        FILE* f = fopen(path, "r");
-        if (!f || fscanf(f, "%d", &pkg) != 1) { if (f) fclose(f); return; }
-        fclose(f);
-        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/core_id", c);
-        f = fopen(path, "r");
-        if (!f || fscanf(f, "%d", &core) != 1) { if (f) fclose(f); return; }
-        fclose(f);
-        cpus.push_back({{pkg, core}, c});
-    }
-    sort(cpus.begin(), cpus.end());
-    // round r takes the r-th CPU of every core
-    vector<vector<int>> by_core;
-    for (size_t i = 0; i < cpus.size(); i++) {
-        if (i == 0 || cpus[i].first != cpus[i - 1].first) by_core.emplace_back();
-        by_core.back().push_back(cpus[i].second);
-    }
-    for (size_t r = 0;; r++) {
-        bool any = false;
-        for (auto& v : by_core)
-            if (r < v.size()) PIN.push_back(v[r]), any = true;
-        if (!any) break;
-    }
-}
-static void pin_self(int tid) {
-    if (PIN.empty()) return;
-    cpu_set_t cs;
-    CPU_ZERO(&cs);
-    CPU_SET(PIN[(size_t)tid % PIN.size()], &cs);
-    sched_setaffinity(0, sizeof cs, &cs);
-}
 template <class F>
 static void par_for(int n, F&& f) {
     const int NT = PAR_NT ? PAR_NT : ::NT;
     atomic<int> next(0);
     auto work = [&](int tid) {
-        pin_self(tid);
         for (;;) {
             int i = next.fetch_add(1, memory_order_relaxed);
             if (i >= n) break;
@@ -211,15 +164,6 @@ static inline u64 key_find(const char* p, size_t n) {
     u64 k;
     if (short_code(p, n, k)) return k;
     return pool_find(p, n);
-}
-// key_find with the SIMD short-code path when 16 bytes are readable at p
-static inline u64 key_find_fast(const char* p, u32 n, const char* bufend) {
-    u64 k;
-    if (__builtin_expect(p + 16 <= bufend, 1)) {
-        if (short_code_simd(p, n, k)) return k;
-        return pool_find(p, n);
-    }
-    return key_find(p, n);
 }
 static string key_str(u64 k) {
     if (k & POOLBIT) {
@@ -537,6 +481,7 @@ static inline bool split(const char* p, const char* e, const char** fs, u32* fl)
 struct Mapped {
     const char* p = nullptr;
     size_t n = 0;
+    int fd = -1;  // kept open for the big inputs, which are read with pread
 };
 static Mapped map_file(const string& path) {
     Mapped m;
@@ -548,6 +493,8 @@ static Mapped map_file(const string& path) {
         if (a != MAP_FAILED) {
             m.p = (const char*)a;
             m.n = (size_t)st.st_size;
+            m.fd = fd;
+            return m;
         }
     }
     close(fd);
@@ -573,11 +520,12 @@ struct Task {
     const char* b;
     size_t size, begin, end;
     int kind;
+    int fd = -1;
 };
 static void add_tasks(vector<Task>& tasks, const vector<Mapped>& files, int kind, size_t chunk) {
     for (auto& m : files) {
         if (!m.n) continue;
-        for (size_t s = 0; s < m.n; s += chunk) tasks.push_back(Task{m.p, m.n, s, min(m.n, s + chunk), kind});
+        for (size_t s = 0; s < m.n; s += chunk) tasks.push_back(Task{m.p, m.n, s, min(m.n, s + chunk), kind, m.fd});
     }
 }
 // Position of the first data line starting in [t.begin, ...), skipping the header.
@@ -670,88 +618,9 @@ struct ColData {
     int conv;     // -1 none, 0 UTF8, 6 DATE
     int logical;  // 0 none, 1 STRING, 6 DATE
     string page;
-    int enc = 0;  // 0 PLAIN, 5 DELTA_BINARY_PACKED, 7 DELTA_BYTE_ARRAY
 };
 static void put32(string& s, u32 v) { s.append((const char*)&v, 4); }
 
-// ---- Parquet DELTA_BINARY_PACKED / DELTA_BYTE_ARRAY encoders ----------------
-// DELTA_BINARY_PACKED: header <block size 128> <4 miniblocks> <count> <first
-// value (zigzag)>, then per block <min delta (zigzag)> <4 bit widths> and the
-// miniblocks of 32 (delta - min delta) values bit-packed LSB first. A partial
-// last block keeps all 4 width bytes; unneeded miniblocks have width 0 and no
-// body; the last used miniblock is padded to 32 values with zeros.
-static void put_uleb(string& s, u64 v) {
-    while (v >= 0x80) s.push_back((char)(v | 0x80)), v >>= 7;
-    s.push_back((char)v);
-}
-static inline u64 zigzag(i64 v) { return ((u64)v << 1) ^ (u64)(v >> 63); }
-static void delta_binary_packed(string& s, const i64* v, size_t n) {
-    put_uleb(s, 128);
-    put_uleb(s, 4);
-    put_uleb(s, n);
-    put_uleb(s, zigzag(n ? v[0] : 0));
-    u64 d[128];
-    for (size_t b = 1; b < n; b += 128) {
-        const size_t m = min<size_t>(128, n - b);
-        i64 mn = INT64_MAX;
-        for (size_t i = 0; i < m; i++) {
-            const i64 x = (i64)((u64)v[b + i] - (u64)v[b + i - 1]);
-            d[i] = (u64)x;
-            mn = min(mn, x);
-        }
-        put_uleb(s, zigzag(mn));
-        for (size_t i = 0; i < m; i++) d[i] -= (u64)mn;
-        for (size_t i = m; i < 128; i++) d[i] = 0;
-        const size_t nmb = (m + 31) / 32;
-        u8 w[4] = {0, 0, 0, 0};
-        for (size_t k = 0; k < nmb; k++) {
-            u64 o = 0;
-            for (size_t i = 0; i < 32; i++) o |= d[k * 32 + i];
-            w[k] = (u8)(o ? 64 - __builtin_clzll(o) : 0);
-        }
-        s.append((const char*)w, 4);
-        for (size_t k = 0; k < nmb; k++) {
-            const int bw = w[k];
-            if (!bw) continue;
-            // 32 values of bw bits = 4 * bw bytes
-            u64 acc = 0;
-            int nb = 0;
-            for (size_t i = 0; i < 32; i++) {
-                const u64 x = d[k * 32 + i];
-                acc |= x << nb;
-                const int room = 64 - nb;
-                if (bw >= room) {
-                    s.append((const char*)&acc, 8);
-                    acc = room < 64 ? x >> room : 0;
-                    nb = bw - room;
-                } else
-                    nb += bw;
-            }
-            if (nb) s.append((const char*)&acc, (size_t)(nb + 7) / 8);
-        }
-    }
-}
-// DELTA_BYTE_ARRAY: prefix lengths shared with the previous value (DELTA_BINARY_PACKED),
-// then the suffixes as DELTA_LENGTH_BYTE_ARRAY (lengths DELTA_BINARY_PACKED, then bytes).
-static void delta_byte_array(string& s, const vector<string>& vals) {
-    const size_t n = vals.size();
-    vector<i64> pre(n), len(n);
-    string bytes;
-    for (size_t i = 0; i < n; i++) {
-        size_t p = 0;
-        if (i) {
-            const string &a = vals[i - 1], &b = vals[i];
-            const size_t lim = min(a.size(), b.size());
-            while (p < lim && a[p] == b[p]) p++;
-        }
-        pre[i] = (i64)p;
-        len[i] = (i64)(vals[i].size() - p);
-        bytes.append(vals[i], p, string::npos);
-    }
-    delta_binary_packed(s, pre.data(), n);
-    delta_binary_packed(s, len.data(), n);
-    s += bytes;
-}
 static void write_parquet(const string& path, i64 nrows, const vector<ColData>& cols) {
     // The file is "PAR1", per column a page header and its page, then the
     // footer; written with writev straight from the page buffers.
@@ -767,7 +636,7 @@ static void write_parquet(const string& path, i64 nrows, const vector<ColData>& 
             h.fi32(3, (i64)c.page.size());
             h.fstruct(5);
             h.fi32(1, nrows);
-            h.fi32(2, c.enc);
+            h.fi32(2, 0);
             h.fi32(3, 3);
             h.fi32(4, 3);
             h.send();
@@ -813,11 +682,11 @@ static void write_parquet(const string& path, i64 nrows, const vector<ColData>& 
             f.fi32(1, c.ptype);
             if (c.optional) {
                 f.flist(2, 5, 2);
-                f.zz(c.enc);
+                f.zz(0);
                 f.zz(3);
             } else {
                 f.flist(2, 5, 1);
-                f.zz(c.enc);
+                f.zz(0);
             }
             f.flist(3, 8, 1);
             f.uv(c.name.size());
@@ -893,6 +762,58 @@ static int UNKNOWN_CAT;
 static FMap CAMPAIGNS;                   // campaign key -> 1..N
 static vector<string> CAMP_ID, CAMP_CH;  // index 0 = organic
 static vector<Mapped> EVF, CLF, LKF;
+// IDs of the files' own shape (a short prefix and a canonical decimal number,
+// like p123 or c_45) are looked up by the number in a small array. The map
+// from such a string to (prefix, number) is one-to-one, so a hit or a miss
+// there is exact; any other string falls back to the hash map.
+struct NumIdx {
+    char pre[4] = {0, 0, 0, 0};
+    u32 plen = 0;
+    vector<u32> v;  // number -> value + 1, 0 = no such ID
+    bool on = false;
+    void build(const FMap& m, u32 add) {
+        string first;
+        for (auto& e : m.t)
+            if (e.k) { first = key_str(e.k); break; }
+        size_t d = 0;
+        while (d < first.size() && !D(first[d])) d++;
+        if (first.empty() || d == 0 || d > 4 || d == first.size()) return;
+        plen = (u32)d;
+        memcpy(pre, first.data(), d);
+        for (auto& e : m.t) {
+            if (!e.k) continue;
+            string sk = key_str(e.k);
+            u64 num;
+            if (!parse(sk.data(), (u32)sk.size(), num)) continue;
+            if (num >= (1u << 20)) continue;  // such IDs are never found by number: see find
+            if (v.size() <= num) v.resize(max<size_t>(num + 1, v.size() * 2), 0);
+            v[num] = (u32)e.v + add;
+        }
+        on = true;
+    }
+    inline bool parse(const char* p, u32 n, u64& num) const {
+        if (n <= plen || n > plen + 6 || memcmp(p, pre, plen) != 0) return false;
+        const char* q = p + plen;
+        const u32 nd = n - plen;
+        if (q[0] == '0' && nd > 1) return false;
+        u64 x = 0;
+        for (u32 i = 0; i < nd; i++) {
+            const u32 c = (u8)(q[i] - '0');
+            if (c > 9) return false;
+            x = x * 10 + c;
+        }
+        num = x;
+        return true;
+    }
+    // value + add for an ID of the shape, 0 if no such ID, -1 if not of the shape
+    inline i64 find(const char* p, u32 n) const {
+        u64 num;
+        if (!on || !parse(p, n, num) || num >= (1u << 20)) return -1;
+        return num < v.size() ? (i64)v[num] : 0;
+    }
+};
+static NumIdx PIDX, CIDX;
+
 static size_t EV_BYTES, CL_BYTES, LK_BYTES;
 static string OUT_DIR;
 
@@ -963,6 +884,7 @@ static void load_inputs(const string& DATA) {
             KV* s = PRODUCTS.slot(r.first);
             if (!s->k) s->k = r.first, s->v = (u64)rank[r.second];
         }
+        PIDX.build(PRODUCTS, 1);
     }
     {
         string text = read_small(DATA + "/campaigns.csv");
@@ -984,6 +906,7 @@ static void load_inputs(const string& DATA) {
             CAMP_ID.push_back(key_str(r.first));
             CAMP_CH.push_back(r.second);
         }
+        CIDX.build(CAMPAIGNS, 0);
     }
     auto map_all = [&](const string& dir, size_t& bytes) {
         vector<Mapped> v;
@@ -997,25 +920,6 @@ static void load_inputs(const string& DATA) {
     EVF = map_all(DATA + "/events", EV_BYTES);
     CLF = map_all(DATA + "/clicks", CL_BYTES);
     LKF = map_all(DATA + "/links", LK_BYTES);
-    // If the inputs are not in the page cache, the parse would stall on one page
-    // fault at a time per thread. A helper thread asks the kernel to read every
-    // file ahead (links first, then events and clicks in parse-task order), so
-    // the disk queue stays full while the parse runs.
-    if (!getenv("SS_NO_RA"))
-        thread([] {
-            // A chunk whose first 64 KB are resident is taken as cached and skipped,
-            // so a warm run pays almost nothing.
-            const size_t step = (size_t)8 << 20;
-            unsigned char vec[16];
-            for (auto* v : {&LKF, &EVF, &CLF})
-                for (auto& m : *v)
-                    for (size_t o = 0; o < m.n; o += step) {
-                        const size_t len = min(step, m.n - o), probe = min(len, (size_t)16 << 12);
-                        bool cached = mincore((void*)(m.p + o), probe, vec) == 0;
-                        for (size_t q = 0; cached && q < (probe + 4095) / 4096; q++) cached = vec[q] & 1;
-                        if (!cached) madvise((void*)(m.p + o), len, MADV_WILLNEED);
-                    }
-        }).detach();
 }
 
 static void write_campaign_daily(const vector<i64>& cs, const vector<i64>& cps, const vector<i64>& crev,
@@ -1056,8 +960,6 @@ static void write_campaign_daily(const vector<i64>& cs, const vector<i64>& cps, 
 }
 
 
-// The links build groups IDs into NLP parts by the top LB bits of the key's hash.
-static const int LB = 10, NLP = 1 << LB;
 // Huge-page backed, zero-filled array (fresh anonymous memory is already zero).
 template <class T>
 static T* huge_zeroed(size_t n) {
@@ -1069,39 +971,27 @@ static T* huge_zeroed(size_t n) {
     madvise(a, bytes, MADV_HUGEPAGE);
     return (T*)a;
 }
-// Linked ID -> person name: buckets of 4 full keys and their 4 values in one
-// 64-byte line, looked up with one AVX2 compare and a branch-free select. A key
-// is stored in its home bucket (top LMB_BITS of its hash) or, if that is full,
-// in the next bucket with room; LMB_OVF[b] marks buckets that something
-// overflowed past, so a miss there keeps probing (rare).
-struct alignas(64) LBucket {
-    u64 k[4];
-    u64 v[4];
+struct KVArr {
+    KV* p = nullptr;
+    size_t n = 0;
+    KV* data() const { return p; }
 };
-static LBucket* LMB;
-static u8* LMB_OVF;
-static int LMB_BITS = 1;
-static inline u64 lmb_home(u64 h) { return h >> (64 - LMB_BITS); }
-__attribute__((noinline)) static u64 person_slow(u64 k, u64 b) {
-    const u64 mask = ((u64)1 << LMB_BITS) - 1;
+// LMF: every linked ID -> its person, one open-addressing table (linear
+// probing from mix64(key) & LMASK, at most about 2/3 full). An ID that is not
+// in it is its own person.
+static KVArr LMF;
+static u64 LMASK;
+static inline u64 person_of(u64 k) {
+    u64 s = mix64(k) & LMASK;
+    const KV* t = LMF.data();
     for (;;) {
-        const LBucket& B = LMB[b];
-        for (int i = 0; i < 4; i++)
-            if (B.k[i] == k) return B.v[i];
-        if (!LMB_OVF[b]) return k;
-        b = (b + 1) & mask;
+        const KV& e = t[s];
+        if (e.k == k) return e.v;
+        if (!e.k) return k;
+        s = (s + 1) & LMASK;
     }
 }
-static inline u64 person_of(u64 k) {
-    const u64 b = lmb_home(mix64(k));
-    const LBucket& B = LMB[b];
-    const __m256i kk = _mm256_load_si256((const __m256i*)B.k);
-    const u32 m = (u32)_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(kk, _mm256_set1_epi64x((long long)k))));
-    const u64 v = B.v[__builtin_ctz(m | 16) & 3];
-    if (__builtin_expect(!m && LMB_OVF[b], 0)) return person_slow(k, (b + 1) & (((u64)1 << LMB_BITS) - 1));
-    return m ? v : k;
-}
-static inline void person_prefetch(u64 k) { __builtin_prefetch(LMB + lmb_home(mix64(k))); }
+static inline void person_prefetch(u64 k) { __builtin_prefetch(LMF.data() + (mix64(k) & LMASK)); }
 
 #ifdef SS_PROF
 static atomic<u64> PROFC[8];
@@ -1517,7 +1407,10 @@ static void* slab_alloc(Slab& s, size_t n) {
     s.left -= n;
     return r;
 }
-struct Blk {
+#ifndef SS_STG
+#define SS_STG 4
+#endif
+struct alignas(32 * SS_STG < 64 ? 64 : 32 * SS_STG) Blk {  // block data aligned to a whole staging buffer
     Blk* next;
     u32 n;
     u32 pad;
@@ -1531,14 +1424,29 @@ struct Scatter {
     int np = 0;
     u32 brec = 0;
     Slab* slab = nullptr;
-    vector<R*> cur, end;
+    struct CE {
+        R* cur;
+        R* end;
+    };
+    vector<CE> ce;  // write pointer and block end, together in one line
     vector<Blk*> head, tail;
+    // 32-byte records are staged per partition in a cache line and written to
+    // the block a whole line at a time with a non-temporal store: no
+    // read-for-ownership of the (thousands of scattered) destination lines.
+    // cur advances per record; its parity (block data is line aligned) tells
+    // which half of the staging line the record goes to.
+    static constexpr bool NT = sizeof(R) == 32;
+    static constexpr int S = SS_STG;  // records staged per partition, streamed together
+    struct alignas(64) Line {
+        R r[S];
+    };
+    vector<Line> stg;
     void init(int np_, Slab* s, u32 recs) {
         np = np_;
         slab = s;
         brec = recs;
-        cur.assign(np, nullptr);
-        end.assign(np, nullptr);
+        if (NT) stg.assign(np, Line{});
+        ce.assign(np, CE{nullptr, nullptr});
         head.assign(np, nullptr);
         tail.assign(np, nullptr);
     }
@@ -1558,16 +1466,54 @@ struct Scatter {
         else
             head[p] = b;
         tail[p] = b;
-        cur[p] = bdata<R>(b);
-        end[p] = cur[p] + brec;
+        ce[p].cur = bdata<R>(b);
+        ce[p].end = ce[p].cur + brec;
     }
     inline void push(int p, const R& r) {
-        if (__builtin_expect(cur[p] == end[p], 0)) grow(p);
-        *cur[p]++ = r;
+        if constexpr (NT) {
+            R* c = ce[p].cur;
+            const u32 i = (u32)((uintptr_t)c >> 5) & (S - 1);
+            if (__builtin_expect(c == ce[p].end, 0)) {  // only ever at i == 0
+                grow(p);
+                c = ce[p].cur;
+            }
+            stg[p].r[i] = r;
+            if (i == S - 1) {
+                R* d = c - (S - 1);
+#ifdef __AVX512F__
+                for (int k = 0; k < S / 2; k++)
+                    _mm512_stream_si512((__m512i*)(d + 2 * k), _mm512_load_si512((const void*)&stg[p].r[2 * k]));
+#else
+                for (int k = 0; k < S; k++)
+                    _mm256_stream_si256((__m256i*)(d + k), _mm256_load_si256((const __m256i*)&stg[p].r[k]));
+#endif
+            }
+            ce[p].cur = c + 1;
+            return;
+        }
+        R* c = ce[p].cur;
+        if (__builtin_expect(c == ce[p].end, 0)) {
+            grow(p);
+            c = ce[p].cur;
+        }
+        // the block's next lines are written soon: prefetch them for ownership
+        // (thousands of scattered streams defeat the hardware prefetcher)
+        __builtin_prefetch((const char*)c + 192, 1, 3);
+        *c = r;
+        ce[p].cur = c + 1;
     }
     void finish() {
+        if constexpr (NT) {
+            // a staged first half whose line was never streamed
+            for (int p = 0; p < np; p++) {
+                R* c = ce[p].cur;
+                const u32 i = (u32)((uintptr_t)c >> 5) & (S - 1);
+                for (u32 k = 0; k < i; k++) c[(int)k - (int)i] = stg[p].r[k];
+            }
+            _mm_sfence();
+        }
         for (int p = 0; p < np; p++)
-            if (tail[p]) tail[p]->n = (u32)(cur[p] - bdata<R>(tail[p]));
+            if (tail[p]) tail[p]->n = (u32)(ce[p].cur - bdata<R>(tail[p]));
     }
 };
 template <class R>
@@ -1591,6 +1537,7 @@ static size_t gather(vector<Scatter<R>>& sc, int p, vector<R>& out) {
 __attribute__((always_inline)) static inline size_t scan_line(const char* p, const char* bufend, u32* cpos, int& nc, int& nq) {
     nc = 0;
     nq = 0;
+
     const __m256i NLv = _mm256_set1_epi8('\n'), CMv = _mm256_set1_epi8(','), QTv = _mm256_set1_epi8('"');
     size_t off = 0;
     while (p + off + 32 <= bufend) {
@@ -1623,7 +1570,7 @@ __attribute__((always_inline)) static inline size_t scan_line(const char* p, con
 }
 // Fields [fs, fe) from comma positions; strips quotes; false if malformed.
 template <int NF>
-__attribute__((always_inline)) static inline bool fields(const char* p, size_t len, const u32* cp, int nc, int nq, u32* fs, u32* fe) {
+static inline bool fields(const char* p, size_t len, const u32* cp, int nc, int nq, u32* fs, u32* fe) {
     if (nc != NF - 1) return false;
     fs[0] = 0;
     for (int i = 0; i < NF - 1; i++) fe[i] = cp[i], fs[i + 1] = cp[i] + 1;
@@ -1661,6 +1608,165 @@ __attribute__((flatten)) static void for_lines_fast(const Task& t, F&& f) {
     }
 }
 
+// Event lines (7 fields): the whole line is classified from 128 bytes of
+// masks at once. Calls g(p, fs, fe) for every well-formed line, with the field
+// bounds already stripped of their quotes. Lines of 128+ bytes and lines near
+// the end of the buffer take the general path (scan_line + fields).
+typedef unsigned __int128 u128;
+static inline u32 ctz128(u128 x) {
+    const u64 lo = (u64)x;
+    return lo ? (u32)__builtin_ctzll(lo) : 64 + (u32)__builtin_ctzll((u64)(x >> 64));
+}
+static inline u64 pxor64(u64 v) {
+    v ^= v << 1;
+    v ^= v << 2;
+    v ^= v << 4;
+    v ^= v << 8;
+    v ^= v << 16;
+    v ^= v << 32;
+    return v;
+}
+template <class G>
+__attribute__((flatten)) static void for_lines7(const Task& t, G&& g) {
+    const char* b = t.b;
+    const char* bufend = b + t.size;
+    size_t pos = first_line(t);
+    const __m256i NLv = _mm256_set1_epi8('\n'), CMv = _mm256_set1_epi8(','), QTv = _mm256_set1_epi8('"');
+    u32 fs[7], fe[7];
+    while (pos < t.end) {
+        const char* p = b + pos;
+        __builtin_prefetch(p + 8192);  // the input a few pages ahead: page cache pages are 4 KB, past the reach of the hardware prefetcher
+        if (__builtin_expect(p + 128 <= bufend, 1)) {
+#ifdef __AVX512BW__
+            const __m512i w0 = _mm512_loadu_si512((const void*)p);
+            const __m512i w1 = _mm512_loadu_si512((const void*)(p + 64));
+#define SS_MASK64(a, c0, c1) ((u64)_mm512_cmpeq_epi8_mask(c0, _mm512_broadcast_i64x4(a)))
+#define v0 w0
+#define v1 w0
+#define v2 w1
+#define v3 w1
+#else
+            const __m256i v0 = _mm256_loadu_si256((const __m256i*)p);
+            const __m256i v1 = _mm256_loadu_si256((const __m256i*)(p + 32));
+            const __m256i v2 = _mm256_loadu_si256((const __m256i*)(p + 64));
+            const __m256i v3 = _mm256_loadu_si256((const __m256i*)(p + 96));
+#define SS_MASK64(a, c0, c1) \
+    ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(c0, a)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(c1, a)) << 32))
+#endif
+            const u64 n0 = SS_MASK64(NLv, v0, v1), n1 = SS_MASK64(NLv, v2, v3);
+            if (__builtin_expect((n0 | n1) != 0, 1)) {
+                const u32 L = n0 ? (u32)__builtin_ctzll(n0) : 64 + (u32)__builtin_ctzll(n1);
+                const u128 lim = ((u128)1 << L) - 1;
+                const u128 cm = ((u128)SS_MASK64(CMv, v2, v3) << 64 | SS_MASK64(CMv, v0, v1)) & lim;
+                pos += L + 1;
+                const u64 cmlo = (u64)cm, cmhi = (u64)(cm >> 64);
+                if (__builtin_popcountll(cmlo) + __builtin_popcountll(cmhi) != 6) continue;
+                u128 x = cm;
+                fs[0] = 0;
+                for (int k = 0; k < 6; k++) {
+                    const u32 c = ctz128(x);
+                    x &= x - 1;
+                    fe[k] = c;
+                    fs[k + 1] = c + 1;
+                }
+                fe[6] = L;
+                const u128 qt = ((u128)SS_MASK64(QTv, v2, v3) << 64 | SS_MASK64(QTv, v0, v1)) & lim;
+                if (qt) {
+                    // Quotes only at a field's first or last byte, and an even
+                    // number of them before every separator and the line end.
+                    const u128 FS = (cm << 1) | 1, FE = (cm >> 1) | ((u128)1 << (L - 1));
+                    if (qt & ~(FS | FE)) continue;
+                    const u64 qlo = (u64)qt, qhi = (u64)(qt >> 64);
+                    const u64 ilo = pxor64(qlo), ihi = pxor64(qhi) ^ (0 - (u64)(__builtin_popcountll(qlo) & 1));
+                    const u128 in = ((u128)ihi << 64) | ilo;
+                    if (in & (cm | ((u128)1 << L))) continue;
+                    for (int k = 0; k < 7; k++) {
+                        const u32 q = (u32)(qt >> fs[k]) & 1;
+                        fs[k] += q;
+                        fe[k] -= q;
+                    }
+                }
+#undef SS_MASK64
+#ifdef __AVX512BW__
+#undef v0
+#undef v1
+#undef v2
+#undef v3
+#endif
+                g(p, fs, fe);
+                continue;
+            }
+        }
+        u32 cpos[8];
+        int nc, nq;
+        const size_t len = scan_line(p, bufend, cpos, nc, nq);
+        if (fields<7>(p, len, cpos, nc, nq, fs, fe)) g(p, (const u32*)fs, (const u32*)fe);
+        pos += len + 1;
+    }
+}
+
+// Short lines (clicks, links): the same idea as for_lines7 with a 64-byte
+// window. Lines of 64+ bytes or near the buffer end take the general path.
+template <int NF, class G>
+__attribute__((flatten)) static void for_lines_short(const Task& t, G&& g) {
+    const char* b = t.b;
+    const char* bufend = b + t.size;
+    size_t pos = first_line(t);
+    const __m256i NLv = _mm256_set1_epi8('\n'), CMv = _mm256_set1_epi8(','), QTv = _mm256_set1_epi8('"');
+    u32 fs[NF], fe[NF];
+    while (pos < t.end) {
+        const char* p = b + pos;
+        __builtin_prefetch(p + 4096);
+        if (__builtin_expect(p + 64 <= bufend, 1)) {
+#ifdef __AVX512BW__
+            const __m512i w0 = _mm512_loadu_si512((const void*)p);
+#define SS_MASK64(a, c0, c1) ((u64)_mm512_cmpeq_epi8_mask(w0, _mm512_broadcast_i64x4(a)))
+#else
+            const __m256i v0 = _mm256_loadu_si256((const __m256i*)p);
+            const __m256i v1 = _mm256_loadu_si256((const __m256i*)(p + 32));
+#define SS_MASK64(a, c0, c1) \
+    ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(c0, a)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(c1, a)) << 32))
+#endif
+            const u64 n0 = SS_MASK64(NLv, v0, v1);
+            if (__builtin_expect(n0 != 0, 1)) {
+                const u32 L = (u32)__builtin_ctzll(n0);
+                const u64 lim = (n0 - 1) & ~n0;  // bits below L
+                const u64 cm = SS_MASK64(CMv, v0, v1) & lim;
+                pos += L + 1;
+                if (__builtin_popcountll(cm) != NF - 1) continue;
+                u64 x = cm;
+                fs[0] = 0;
+                for (int k = 0; k < NF - 1; k++) {
+                    const u32 c = (u32)__builtin_ctzll(x);
+                    x &= x - 1;
+                    fe[k] = c;
+                    fs[k + 1] = c + 1;
+                }
+                fe[NF - 1] = L;
+                const u64 qt = SS_MASK64(QTv, v0, v1) & lim;
+                if (qt) {
+                    const u64 FS = (cm << 1) | 1, FE = (cm >> 1) | ((u64)1 << (L - 1));
+                    if (qt & ~(FS | FE)) continue;
+                    if (pxor64(qt) & (cm | ((u64)1 << L))) continue;
+                    for (int k = 0; k < NF; k++) {
+                        const u32 q = (u32)(qt >> fs[k]) & 1;
+                        fs[k] += q;
+                        fe[k] -= q;
+                    }
+                }
+#undef SS_MASK64
+                g(p, (const u32*)fs, (const u32*)fe);
+                continue;
+            }
+        }
+        u32 cpos[8];
+        int nc, nq;
+        const size_t len = scan_line(p, bufend, cpos, nc, nq);
+        if (fields<NF>(p, len, cpos, nc, nq, fs, fe)) g(p, (const u32*)fs, (const u32*)fe);
+        pos += len + 1;
+    }
+}
+
 static inline u32 load4(const char* p) {
     u32 v;
     memcpy(&v, p, 4);
@@ -1672,12 +1778,65 @@ static inline u64 load8(const char* p) {
     return v;
 }
 
+// One well-formed event line (field bounds fs/fe) -> r; false if event_id is empty.
+__attribute__((always_inline)) static inline bool parse_event(const char* p, const u32* fs, const u32* fe,
+                                                               const char* bufend, EvRec& r) {
+    u32 l0 = fe[0] - fs[0];
+    if (!l0) return false;
+    r.eid = key_of_fast(p + fs[0], l0, bufend);
+    i64 ing;
+    if (!parse_ts_fast(p + fs[3], fe[3] - fs[3], ing)) ing = INT64_MAX;
+    r.ingest = ing;
+    r.user = 0;
+    r.ts = BAD_TS;
+    r.aux = 0;
+    do {
+        u32 l1 = fe[1] - fs[1];
+        if (!l1) break;
+        i64 ts;
+        if (!parse_ts_fast(p + fs[2], fe[2] - fs[2], ts) || ts < WS || ts >= WE) break;
+        u32 l4 = fe[4] - fs[4];
+        const char* ty = p + fs[4];
+        int type;
+        if (l4 == 4) {
+            u32 w = load4(ty);
+            if (w == 0x77656976u)  // "view"
+                type = 0;
+            else if (w == 0x74726163u)  // "cart"
+                type = 1;
+            else
+                break;
+        } else if (l4 == 8 && load8(ty) == 0x6573616863727570ULL)  // "purchase"
+            type = 2;
+        else
+            break;
+        if (fe[5] == fs[5]) break;
+        u32 price = 0;
+        if (type == 2 && !parse_price(p + fs[6], fe[6] - fs[6], price)) break;
+        if (ing - ts > DAY_MS) break;
+        r.user = key_of_fast(p + fs[1], l1, bufend);
+        r.ts = (u32)(ts - CBASE);
+        if (type == 2) {
+            const i64 hit = PIDX.find(p + fs[5], fe[5] - fs[5]);
+            u32 cat;
+            if (hit >= 0)
+                cat = hit ? (u32)(hit - 1) : (u32)UNKNOWN_CAT;
+            else {
+                u64 pk = key_find(p + fs[5], fe[5] - fs[5]);
+                const KV* pe = pk ? PRODUCTS.get(pk) : nullptr;
+                cat = (u32)(pe ? pe->v : (u64)UNKNOWN_CAT);
+            }
+            r.aux = price | (cat << 24);
+        }
+    } while (0);
+    return true;
+}
+
 // ---- per-thread state -----------------------------------------------------------
 struct Thr {
     Slab slab;
     Scatter<EvRec> se;
     Scatter<CRec> sc;
-    Scatter<CRec> craw;  // clicks before person resolution (one list)
     Scatter<PRec> sp;
     // pass 3 outputs
     vector<u64> uid;
@@ -1685,11 +1844,7 @@ struct Thr {
     vector<i32> ses, evs;
     vector<i64> rev;
     vector<i16> top;
-    struct CCell {  // per (campaign, day): sessions, purchasing sessions, revenue
-        i64 s, ps, rev;
-    };
-    vector<CCell> cc;
-    vector<i64> cas;
+    vector<i64> cs, cps, crev, cas;
     vector<int> cnt, pos, active;
     vector<i64> catsum;
     vector<int> touched;
@@ -1707,7 +1862,10 @@ static void run() {
         while (b < hi && ((u64)1 << b) * per < n) b++;
         return b;
     };
-    PE_BITS = bits_for(est_events, getenv("SS_PE") ? (u64)atoi(getenv("SS_PE")) : 12000, 6, 13);
+    // at most 2048 event partitions: more makes the parse scatter (per-partition
+    // staging lines and write pointers) spill out of L2, which costs more than
+    // the larger dedup partitions
+    PE_BITS = bits_for(est_events, getenv("SS_PE") ? (u64)atoi(getenv("SS_PE")) : 12000, 6, 11);
     NPE = 1 << PE_BITS;
     PP_BITS = bits_for(est_events, getenv("SS_PP") ? (u64)atoi(getenv("SS_PP")) : 64000, 6, 13);
     NPP = 1 << PP_BITS;
@@ -1717,105 +1875,83 @@ static void run() {
         t.se.init(NPE, &t.slab, 512);
         static_assert(sizeof(EvRec) * 512 == sizeof(PRec) * 1024, "recycled event blocks must fit person blocks");
         t.sc.init(NPP, &t.slab, 256);
-        t.craw.init(1, &t.slab, 256);  // same block size as sc: raw blocks are recycled into sc
         t.sp.init(NPP, &t.slab, 1024);
     }
     // ---- links build on their own thread, overlapped with the parse -------------
-    // ---- pass 1: parse events and clicks; task 0 builds the links -----------------
-    // (inside the pool, so there are never more runnable threads than NCPU: the
-    // grader's CPU limit is a time quota, and extra threads get throttled)
+    static atomic<bool> links_ready(false);
+    thread links_thread([] {
+        PAR_NT = getenv("SS_LINK_NT") ? max(1, atoi(getenv("SS_LINK_NT"))) : 2;
+        build_links();
+        links_ready.store(true, memory_order_release);
+        tick("links built (overlapped)");
+    });
+    // ---- pass 1: parse events and clicks ------------------------------------------
     {
         size_t total = EV_BYTES + CL_BYTES;
         size_t chunk = max<size_t>(256 << 10, min<size_t>(4 << 20, total / (NT * 32) + 1));
+        if (getenv("SS_CHUNK")) chunk = (size_t)atoi(getenv("SS_CHUNK")) << 10;
         vector<Task> tasks;
         add_tasks(tasks, EVF, 0, chunk);
         add_tasks(tasks, CLF, 1, chunk);
-        par_for((int)tasks.size() + 1, [&](int ti0, int tid) {
-            if (ti0 == 0) {
-                build_links();
-                tick("links built (overlapped)");
-                return;
-            }
-            const Task& t = tasks[ti0 - 1];
+        par_for((int)tasks.size(), [&](int ti, int tid) {
+            const Task& t = tasks[ti];
             const char* const bufend = t.b + t.size;
             Thr& T = th[tid];
             if (t.kind == 0) {
                 Scatter<EvRec>& se = T.se;
                 const int sh = 64 - PE_BITS;
-                for_lines_fast(t, [&](const char* p, size_t len, const u32* cp, int nc, int nq) {
-                    u32 fs[7], fe[7];
-                    if (!fields<7>(p, len, cp, nc, nq, fs, fe)) return;
-                    u32 l0 = fe[0] - fs[0];
-                    if (!l0) return;
+                for_lines7(t, [&](const char* p, const u32* fs, const u32* fe) {
                     EvRec r;
-                    r.eid = key_of_fast(p + fs[0], l0, bufend);
-                    i64 ing;
-                    if (!parse_ts_fast(p + fs[3], fe[3] - fs[3], ing)) ing = INT64_MAX;
-                    r.ingest = ing;
-                    r.user = 0;
-                    r.ts = BAD_TS;
-                    r.aux = 0;
-                    do {
-                        u32 l1 = fe[1] - fs[1];
-                        if (!l1) break;
-                        i64 ts;
-                        if (!parse_ts_fast(p + fs[2], fe[2] - fs[2], ts) || ts < WS || ts >= WE) break;
-                        u32 l4 = fe[4] - fs[4];
-                        const char* ty = p + fs[4];
-                        int type;
-                        if (l4 == 4) {
-                            u32 w = load4(ty);
-                            if (w == 0x77656976u)  // "view"
-                                type = 0;
-                            else if (w == 0x74726163u)  // "cart"
-                                type = 1;
-                            else
-                                break;
-                        } else if (l4 == 8 && load8(ty) == 0x6573616863727570ULL)  // "purchase"
-                            type = 2;
-                        else
-                            break;
-                        if (fe[5] == fs[5]) break;
-                        u32 price = 0;
-                        if (type == 2 && !parse_price(p + fs[6], fe[6] - fs[6], price)) break;
-                        if (ing - ts > DAY_MS) break;
-                        r.user = key_of_fast(p + fs[1], l1, bufend);
-                        r.ts = (u32)(ts - CBASE);
-                        if (type == 2) {
-                            u64 pk = key_find_fast(p + fs[5], fe[5] - fs[5], bufend);
-                            const KV* pe = pk ? PRODUCTS.get(pk) : nullptr;
-                            u32 cat = (u32)(pe ? pe->v : (u64)UNKNOWN_CAT);
-                            r.aux = price | (cat << 24);
-                        }
-                    } while (0);
+                    if (!parse_event(p, fs, fe, bufend, r)) return;
                     se.push((int)(mix64(r.eid) >> sh), r);
                 });
+                _mm_sfence();  // this thread's non-temporal stores are globally visible before the join
             } else {
-                // Clicks keep their raw user key (links may still be building);
-                // persons are resolved in pass 2.
-                Scatter<CRec>& cr = T.craw;
-                for_lines_fast(t, [&](const char* p, size_t len, const u32* cp, int nc, int nq) {
-                    u32 fs[4], fe[4];
-                    if (!fields<4>(p, len, cp, nc, nq, fs, fe)) return;
+                // Click tasks come after every event task, so the links are
+                // normally built by now. Persons are resolved in batches of 32
+                // with their table slots prefetched, then scattered by person.
+                Scatter<CRec>& sc = T.sc;
+                const int sh = 64 - PP_BITS;
+                CRec pend[32];
+                u32 np = 0;
+                auto flush = [&]() {
+                    if (!links_ready.load(memory_order_acquire))
+                        while (!links_ready.load(memory_order_acquire)) sched_yield();
+                    for (u32 i = 0; i < np; i++) person_prefetch(pend[i].person);
+                    for (u32 i = 0; i < np; i++) {
+                        CRec x = pend[i];
+                        x.person = person_of(x.person);
+                        sc.push((int)(mix64(x.person) >> sh), x);
+                    }
+                    np = 0;
+                };
+                for_lines_short<4>(t, [&](const char* p, const u32* fs, const u32* fe) {
                     u32 l0 = fe[0] - fs[0], l1 = fe[1] - fs[1], l2 = fe[2] - fs[2];
                     if (!l0 || !l1 || !l2) return;
                     i64 ts;
                     if (!parse_ts_fast(p + fs[3], fe[3] - fs[3], ts) || ts < CBASE || ts >= WE) return;
-                    u64 ck = key_find_fast(p + fs[2], l2, bufend);
-                    const KV* ce = ck ? CAMPAIGNS.get(ck) : nullptr;
-                    if (!ce) return;
+                    i64 camp = CIDX.find(p + fs[2], l2);
+                    if (camp < 0) {
+                        u64 ck = key_find(p + fs[2], l2);
+                        const KV* ce = ck ? CAMPAIGNS.get(ck) : nullptr;
+                        camp = ce ? (i64)ce->v : 0;
+                    }
+                    if (!camp) return;
                     CRec c;
                     c.person = key_of_fast(p + fs[1], l1, bufend);  // user key for now
                     c.cid = key_of_fast(p + fs[0], l0, bufend);
                     c.ts = (u32)(ts - CBASE);
-                    c.camp = (u32)ce->v;
-                    cr.push(0, c);
+                    c.camp = (u32)camp;
+                    pend[np++] = c;
+                    if (np == 32) flush();
                 });
+                flush();
             }
         });
-        for (auto& t : th) t.se.finish(), t.craw.finish();
+        for (auto& t : th) t.se.finish();
         tick("parse events+clicks");
     }
+    links_thread.join();
     tick("links joined");
 
     // ---- pass 2: dedup events, map to persons ---------------------------------------
@@ -1827,29 +1963,7 @@ static void run() {
         vector<vector<u32>> tabs(NT);
         vector<vector<u8>> wins(NT);
         vector<vector<u32>> survs(NT);
-        par_for(NT + NPE, [&](int task, int tid) {
-            if (task < NT) {
-                // clicks parsed by thread `task`: resolve persons (prefetched), scatter
-                Scatter<CRec>& sc = th[tid].sc;
-                const int sh = 64 - PP_BITS;
-                for (Blk* b = th[task].craw.head[0]; b;) {
-                    Blk* const nb = b->next;
-                    CRec* c = bdata<CRec>(b);
-                    const u32 n = b->n;
-                    const u32 D = 16;
-                    for (u32 i = 0; i < n && i < D; i++) person_prefetch(c[i].person);
-                    for (u32 i = 0; i < n; i++) {
-                        if (i + D < n) person_prefetch(c[i + D].person);
-                        CRec x = c[i];
-                        x.person = person_of(x.person);
-                        sc.push((int)(mix64(x.person) >> sh), x);
-                    }
-                    sc.free_blocks.push_back(b);  // read: reuse it for resolved clicks
-                    b = nb;
-                }
-                return;
-            }
-            const int p = task - NT;
+        par_for(NPE, [&](int p, int tid) {
             auto& buf = bufs[tid];
             size_t n = gather(ses, p, buf);
             if (!n) return;
@@ -1921,7 +2035,9 @@ static void run() {
     // ---- pass 3: per person partition -------------------------------------------------
     for (auto& t : th) {
         size_t cells = (size_t)NCAMP * NDAYS;
-        t.cc.assign(cells, Thr::CCell{0, 0, 0});
+        t.cs.assign(cells, 0);
+        t.cps.assign(cells, 0);
+        t.crev.assign(cells, 0);
         t.cas.assign(cells, 0);
         t.cnt.assign(NCAMP, 0);
         t.pos.assign(NCAMP, 0);
@@ -2234,10 +2350,9 @@ static void run() {
                     }
                     u32 credited = hi > lo ? C[hi - 1].camp : 0;
                     size_t cell = (size_t)credited * NDAYS + day;
-                    Thr::CCell& cl = T.cc[cell];
-                    cl.s += 1;
-                    cl.ps += purch;
-                    cl.rev += rev;
+                    T.cs[cell] += 1;
+                    T.cps[cell] += purch;
+                    T.crev[cell] += rev;
                     for (int c : T.active) T.cas[(size_t)c * NDAYS + day] += 1;
                     s = e;
                 }
@@ -2280,27 +2395,17 @@ static void run() {
             size_t n = T.uid.size();
             if (n == 0 && !(ti == 0 && total_rows == 0)) return;
             vector<ColData> cols(6);
-            // delta encodings: rows come grouped by person in day order, so
-            // user_id repeats and day, sessions, events have small deltas
-            cols[0] = {"user_id", PT_BYTES, false, 0, 1, "", 7};
-            {
-                vector<string> ids(n);
-                for (size_t r = 0; r < n; r++) ids[r] = key_str(T.uid[r]);
-                delta_byte_array(cols[0].page, ids);
-            }
-            vector<i64> tmp(n);
-            auto delta_col = [&](ColData& c, auto* src) {
-                for (size_t r = 0; r < n; r++) tmp[r] = (i64)src[r];
-                delta_binary_packed(c.page, tmp.data(), n);
-            };
-            cols[1] = {"day", PT_INT32, false, 6, 6, "", 5};
-            delta_col(cols[1], T.day.data());
-            cols[2] = {"sessions", PT_INT32, false, -1, 0, "", 5};
-            delta_col(cols[2], T.ses.data());
-            cols[3] = {"events", PT_INT32, false, -1, 0, "", 5};
-            delta_col(cols[3], T.evs.data());
-            cols[4] = {"revenue_cents", PT_INT64, false, -1, 0, "", 5};
-            delta_col(cols[4], T.rev.data());
+            cols[0] = {"user_id", PT_BYTES, false, 0, 1, ""};
+            cols[0].page.reserve(n * 14);
+            for (size_t r = 0; r < n; r++) put_key(cols[0].page, T.uid[r]);
+            cols[1] = {"day", PT_INT32, false, 6, 6, ""};
+            cols[1].page.append((const char*)T.day.data(), n * 4);
+            cols[2] = {"sessions", PT_INT32, false, -1, 0, ""};
+            cols[2].page.append((const char*)T.ses.data(), n * 4);
+            cols[3] = {"events", PT_INT32, false, -1, 0, ""};
+            cols[3].page.append((const char*)T.evs.data(), n * 4);
+            cols[4] = {"revenue_cents", PT_INT64, false, -1, 0, ""};
+            cols[4].page.append((const char*)T.rev.data(), n * 8);
             cols[5] = {"top_category", PT_BYTES, true, 0, 1, ""};
             vector<u8> def(n);
             for (size_t r = 0; r < n; r++) def[r] = T.top[r] >= 0;
@@ -2319,9 +2424,9 @@ static void run() {
         vector<i64> cs(cells, 0), cps(cells, 0), crev(cells, 0), cas(cells, 0);
         for (auto& t : th)
             for (size_t x = 0; x < cells; x++) {
-                cs[x] += t.cc[x].s;
-                cps[x] += t.cc[x].ps;
-                crev[x] += t.cc[x].rev;
+                cs[x] += t.cs[x];
+                cps[x] += t.cps[x];
+                crev[x] += t.crev[x];
                 cas[x] += t.cas[x];
             }
         write_campaign_daily(cs, cps, crev, cas);
@@ -2331,13 +2436,12 @@ static void run() {
 
 }  // namespace fast
 
-// Links -> LMB (linked ID -> person name), single-threaded and cache-friendly:
+// Links -> LMF, single-threaded:
 //  1. parse every link line into a flat pair array (AVX2 line scan, SIMD keys)
-//  2. counting-sort pair slots by sub-table (top LB bits of the key hash)
-//  3. per sub-table, a small L1/L2-sized table dedupes keys and assigns dense
-//     ids, written straight back into the pair array (no second lookup)
-//  5. union-find over the dense ids, then each id's person = smallest key
-//  6. LMB filled in id order (ids are grouped by hash prefix, so writes stay local)
+//  2. LMF assigns dense ids to the keys (prefetched lookups in input order)
+//  3. union-find over the dense ids
+//  4. each id's person = the smallest key of its component
+//  5. one pass over LMF replaces ids by persons
 static void build_links() {
     vector<u64> A;  // A[2j], A[2j+1]: the two keys of link j
     A.reserve(LK_BYTES / 9 + 16);
@@ -2345,9 +2449,7 @@ static void build_links() {
         if (!m.n) continue;
         Task t{m.p, m.n, 0, m.n, 2};
         const char* const bufend = m.p + m.n;
-        fast::for_lines_fast(t, [&](const char* p, size_t len, const u32* cp, int nc, int nq) {
-            u32 fs[2], fe[2];
-            if (!fast::fields<2>(p, len, cp, nc, nq, fs, fe)) return;
+        fast::for_lines_short<2>(t, [&](const char* p, const u32* fs, const u32* fe) {
             const u32 l0 = fe[0] - fs[0], l1 = fe[1] - fs[1];
             if (!l0 || !l1) return;
             A.push_back(key_of_fast(p + fs[0], l0, bufend));
@@ -2355,62 +2457,43 @@ static void build_links() {
         });
     }
     const size_t M = A.size();
-    // 2. group slots by sub-table
-    vector<u32> cnt(NLP + 1, 0);
-    vector<u16> part(M);
-    for (size_t j = 0; j < M; j++) {
-        const u32 q = (u32)(mix64(A[j]) >> (64 - LB));
-        part[j] = (u16)q;
-        cnt[q + 1]++;
-    }
-    for (int q = 0; q < NLP; q++) cnt[q + 1] += cnt[q];
-    vector<u32> ord(M);
-    {
-        vector<u32> at(cnt.begin(), cnt.end() - 1);
-        for (size_t j = 0; j < M; j++) ord[at[part[j]]++] = (u32)j;
-    }
-    // 3. dense ids per sub-table, written back as ids[j]
+    // 2. LMF doubles as the key -> dense id table while the components are
+    // found: v holds the id first and the person at the end. Keys are looked
+    // up in input order with the table slot prefetched 16 keys ahead.
+    size_t cap = 16;
+    while (cap < M + M / 2) cap <<= 1;
+    LMASK = cap - 1;
+    LMF.n = cap;
+    LMF.p = huge_zeroed<KV>(cap);
+    KV* T = LMF.p;
     vector<u32> ids(M);
     vector<u64> keys;  // id -> key
     keys.reserve(M / 2 + 16);
-    vector<u32> dbase(NLP + 1, 0);
-    u32 maxd = 0;
-    vector<u64> tk;
-    vector<u32> tv;
-    for (int q = 0; q < NLP; q++) {
-        const u32 a0 = cnt[q], a1 = cnt[q + 1];
-        dbase[q] = (u32)keys.size();
-        if (a0 == a1) continue;
-        size_t cap = 16;
-        while (cap < (size_t)(a1 - a0) * 2) cap <<= 1;
-        tk.assign(cap, 0);
-        tv.resize(cap);
-        const u64 mask = cap - 1;
-        for (u32 x = a0; x < a1; x++) {
-            const u32 j = ord[x];
+    {
+        const size_t D = 16;
+        for (size_t j = 0; j < M && j < D; j++) __builtin_prefetch(T + (mix64(A[j]) & LMASK), 1);
+        for (size_t j = 0; j < M; j++) {
+            if (j + D < M) __builtin_prefetch(T + (mix64(A[j + D]) & LMASK), 1);
             const u64 k = A[j];
-            u64 s = mix64(k) & mask;
+            u64 s = mix64(k) & LMASK;
             for (;;) {
-                if (tk[s] == k) {
-                    ids[j] = tv[s];
+                if (T[s].k == k) {
+                    ids[j] = (u32)T[s].v;
                     break;
                 }
-                if (!tk[s]) {
-                    tk[s] = k;
-                    tv[s] = (u32)keys.size();
-                    ids[j] = tv[s];
+                if (!T[s].k) {
+                    T[s].k = k;
+                    T[s].v = keys.size();
+                    ids[j] = (u32)keys.size();
                     keys.push_back(k);
                     break;
                 }
-                s = (s + 1) & mask;
+                s = (s + 1) & LMASK;
             }
         }
-        maxd = max(maxd, (u32)keys.size() - dbase[q]);
     }
-    dbase[NLP] = (u32)keys.size();
     const u32 N = (u32)keys.size();
-    (void)maxd;
-    // 5. union-find (path halving; the smaller id becomes the root)
+    // 3. union-find (path halving; the smaller id becomes the root)
     vector<u32> par(N);
     for (u32 i = 0; i < N; i++) par[i] = i;
     auto find = [&](u32 x) {
@@ -2428,34 +2511,18 @@ static void build_links() {
         else
             par[a] = b;
     }
+    // 4. each id's person: the smallest key of its component
     vector<u64> nm(keys);  // root -> smallest key of its component
     for (u32 i = 0; i < N; i++) {
         const u32 r = find(i);
         par[i] = r;
         if (r != i && key_less(keys[i], nm[r])) nm[r] = keys[i];
     }
-    // 6. the lookup table: about 1/3 full (4 slots per bucket)
-    LMB_BITS = 1;
-    while (((size_t)4 << LMB_BITS) < (size_t)N * 3) LMB_BITS++;
-    const u64 nb = (u64)1 << LMB_BITS, bmask = nb - 1;
-    LMB = huge_zeroed<LBucket>(nb);
-    LMB_OVF = huge_zeroed<u8>(nb);
-    for (u32 i = 0; i < N; i++) {  // ids are grouped by hash prefix: bucket writes stay local
-        const u64 k = keys[i];
-        u64 b = lmb_home(mix64(k));
-        for (;;) {
-            LBucket& B = LMB[b];
-            int f = 0;
-            while (f < 4 && B.k[f]) f++;
-            if (f < 4) {
-                B.k[f] = k;
-                B.v[f] = nm[par[i]];
-                break;
-            }
-            LMB_OVF[b] = 1;
-            b = (b + 1) & bmask;
-        }
-    }
+    vector<u64> pv(N);
+    for (u32 i = 0; i < N; i++) pv[i] = nm[par[i]];
+    // 5. ids -> persons, in one sequential pass over the table
+    for (size_t s = 0; s < cap; s++)
+        if (T[s].k) T[s].v = pv[T[s].v];
 }
 
 // SS_SELFTEST=1: differential tests of the fast helpers against the plain ones.
@@ -2543,14 +2610,6 @@ static int selftest() {
 }
 
 int main(int argc, char** argv) {
-    // glibc malloc on transparent huge pages (fewer page faults for the large
-    // vectors). Tunables are read at process start, so set it and re-exec once
-    // (or let the exec of the AVX-512 build below carry it).
-    bool reexec = false;
-    if (!getenv("GLIBC_TUNABLES") && !getenv("SS_NO_TUNE")) {
-        setenv("GLIBC_TUNABLES", "glibc.malloc.hugetlb=1", 1);
-        reexec = true;
-    }
 #ifdef SS_DISPATCH_TO
     // This build targets x86-64-v3 (AVX2). If the CPU has everything x86-64-v4
     // needs (AVX-512 F/BW/CD/DQ/VL), hand over to the AVX-512 build. If that
@@ -2561,11 +2620,9 @@ int main(int argc, char** argv) {
         __builtin_cpu_supports("avx512vl"))
         execv(SS_DISPATCH_TO, argv);
 #endif
-    if (reexec) execv("/proc/self/exe", argv);  // if this fails, run without the tunable
     T0 = chrono::steady_clock::now();
     DBG = getenv("SS_DEBUG") != nullptr;
     init_codes();
-    init_pinning();
     if (getenv("SS_SELFTEST")) return selftest();
     string DATA = env_or("DATA_DIR", "/data");
     OUT_DIR = env_or("OUTPUT_DIR", "/output");
