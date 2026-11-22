@@ -1679,6 +1679,8 @@ struct Thr {
     Scatter<CRec> sc;
     Scatter<CRec> craw;  // clicks before person resolution (one list)
     Scatter<PRec> sp;
+    Scatter<EvRec> eodd;  // decoded path: events / clicks whose IDs do not decode
+    Scatter<CRec> cs, codd;
     // pass 3 outputs
     vector<u64> uid;
     vector<i32> day;
@@ -2329,6 +2331,1249 @@ static void run() {
     tick("write");
 }
 
+// ---- generator ID decoding ---------------------------------------------------------
+// The generator writes IDs as prefix + base36(scramble(n, key)), where scramble is
+// a bijection on 40 bits and n is a small dense number (event index, click index,
+// user index * 512 + alias). The keys are recovered at start from a few sample
+// IDs; a decoded number is only ever used as an exact, injective stand-in for its
+// ID string (canonical base36 only), so a wrong or missing key changes speed,
+// never output: anything that does not decode goes through the general path.
+static const u64 DM = (1ULL << 40) - 1, DA = 0x9E3779B97F4BULL, DB = 0xD6E8FEB86659ULL;
+static u64 DAi, DBi;
+struct DKey {
+    u64 key = 0;
+    int bits = 0;
+    bool ok = false;
+};
+static DKey DKE, DKC, DKU;
+static inline u64 d_inv(u64 a) {
+    u64 x = a;
+    for (int i = 0; i < 6; i++) x *= 2 - a * x;
+    return x & DM;
+}
+static inline u64 d_unmix(u64 v) {
+    const u64 t = (v * DBi) & DM;
+    return t ^ (t >> 17) ^ (t >> 34);
+}
+// Value of a short-code key spelled prefix + canonical lowercase base36 (1 to 8 digits).
+static inline bool d_val(u64 k, u32 prefix, u64& v) {
+    if ((k >> 56) != prefix) return false;
+    const u64 B = _pdep_u64(k, 0x7F7F7F7F7F7F7F7FULL);  // byte 7 = first digit ... byte 0 = 8th
+    if (!B) return false;
+    const int z = __builtin_ctzll(B) >> 3;  // trailing empty bytes: n = 8 - z digits
+    const __m128i c = _mm_cvtsi64_si128((long long)B);
+    const __m128i dig = _mm_and_si128(_mm_cmpgt_epi8(c, _mm_set1_epi8(0x2F)), _mm_cmplt_epi8(c, _mm_set1_epi8(0x3A)));
+    const __m128i low = _mm_and_si128(_mm_cmpgt_epi8(c, _mm_set1_epi8(0x60)), _mm_cmplt_epi8(c, _mm_set1_epi8(0x7B)));
+    const u32 ok = (u32)_mm_movemask_epi8(_mm_or_si128(dig, low)) & 0xFF;
+    const u32 need = (0xFFu << z) & 0xFF;
+    if ((ok & need) != need) return false;
+    if (z < 7 && (B >> 56) == '0') return false;  // leading zero
+    const __m128i d = _mm_sub_epi8(_mm_sub_epi8(c, _mm_set1_epi8(0x30)), _mm_and_si128(low, _mm_set1_epi8(0x27)));
+    u64 D = (u64)_mm_cvtsi128_si64(d);
+    D = z ? (D >> (8 * z)) : D;  // byte 0 = last digit
+    const u64 t1 = (D & 0x00FF00FF00FF00FFULL) + ((D >> 8) & 0x00FF00FF00FF00FFULL) * 36;
+    const u64 t2 = (t1 & 0x0000FFFF0000FFFFULL) + ((t1 >> 16) & 0x0000FFFF0000FFFFULL) * 1296;
+    const u64 r = (t2 & 0xFFFFFFFFULL) + (t2 >> 32) * 1679616ULL;
+    if (r > DM) return false;
+    v = r;
+    return true;
+}
+static inline bool d_val_slow(u64 k, u32 prefix, u64& v) {
+    if ((k >> 56) != prefix) return false;
+    u64 r = 0;
+    int n = 0;
+    for (int i = 1; i < 9; i++) {
+        const u32 c = (u32)(k >> (56 - 7 * i)) & 127;
+        if (!c) break;
+        u32 d;
+        if (c - '0' < 10u)
+            d = c - '0';
+        else if (c - 'a' < 26u)
+            d = c - 'a' + 10;
+        else
+            return false;
+        if (i == 1 && c == '0' && ((k >> 42) & 127)) return false;
+        r = r * 36 + d;
+        n++;
+    }
+    if (!n || r > DM) return false;
+    v = r;
+    return true;
+}
+// The short-code key of prefix + base36(scramble(x)): the exact ID that decodes to x.
+static inline u64 d_key_of(u64 x, u32 prefix, const DKey& D) {
+    u64 m = ((x * DA) ^ D.key) & DM;
+    m ^= m >> 17;
+    u64 v = (m * DB) & DM;
+    char buf[8];
+    int n = 0;
+    do {
+        buf[n++] = "0123456789abcdefghijklmnopqrstuvwxyz"[v % 36];
+        v /= 36;
+    } while (v);
+    u64 k = (u64)prefix << 56;
+    for (int i = 0; i < n; i++) k |= (u64)(u8)buf[n - 1 - i] << (49 - 7 * i);
+    return k;
+}
+static inline bool d_dec(u64 k, u32 prefix, const DKey& D, u64& x) {
+    u64 v;
+    if (!d_val(k, prefix, v)) return false;
+    x = ((d_unmix(v) ^ D.key) * DAi) & DM;
+    return (x >> D.bits) == 0;
+}
+// d_val straight from field bytes p[0..n) (needs 9 readable bytes at p).
+static inline bool d_val_raw(const char* p, u32 n, u32 prefix, u64& v) {
+    if (n < 2 || n > 9 || (u8)p[0] != prefix) return false;
+    const u32 nd = n - 1;
+    u64 B;
+    memcpy(&B, p + 1, 8);
+    const u64 m = nd == 8 ? ~0ULL : ((1ULL << (8 * nd)) - 1);
+    B &= m;
+    const u64 H = 0x8080808080808080ULL, O = 0x0101010101010101ULL, mh = m & H;
+    if (B & H) return false;
+    const u64 nz = (B + 0x7F * O) & H;
+    const u64 dig = (B + (0x80 - 0x30) * O) & ~(B + (0x7F - 0x39) * O) & H;
+    const u64 low = (B + (0x80 - 0x61) * O) & ~(B + (0x7F - 0x7A) * O) & H;
+    if (nz != mh || (dig | low) != mh) return false;
+    if (nd > 1 && p[1] == '0') return false;
+    u64 D = B - (mh >> 7) * 0x30 - (low >> 7) * 0x27;  // byte 0 = first digit
+    D = __builtin_bswap64(D) >> (8 * (8 - nd));         // byte 0 = last digit
+    const u64 t1 = (D & 0x00FF00FF00FF00FFULL) + ((D >> 8) & 0x00FF00FF00FF00FFULL) * 36;
+    const u64 t2 = (t1 & 0x0000FFFF0000FFFFULL) + ((t1 >> 16) & 0x0000FFFF0000FFFFULL) * 1296;
+    const u64 r = (t2 & 0xFFFFFFFFULL) + (t2 >> 32) * 1679616ULL;
+    if (r > DM) return false;
+    v = r;
+    return true;
+}
+// Decoded number (< 2^56: distinct from every short-code key, which is >= 2^56) or the key.
+static inline u64 d_field(const char* p, u32 n, const char* bufend, u32 prefix, const DKey& D) {
+    u64 v;
+    bool ok;
+    if (__builtin_expect(p + 16 <= bufend, 1))
+        ok = d_val_raw(p, n, prefix, v);
+    else {  // same answer near the end of a buffer: decoding must depend on the ID only
+        char tmp[16] = {0};
+        memcpy(tmp, p, min<u32>(n, 16));
+        ok = d_val_raw(tmp, n, prefix, v);
+    }
+    if (ok) {
+        const u64 x = ((d_unmix(v) ^ D.key) * DAi) & DM;
+        if (!(x >> D.bits)) return x;
+    }
+    return key_of_fast(p, n, bufend);
+}
+static inline bool is_dec(u64 k) { return k < (1ULL << 56); }
+// Brute force: the key whose decoded values of W are all below 2^bits, with the
+// low `fixb` key bits fixed to `fixv`. Needs >= 90% of W to decode small.
+static bool d_search(const vector<u64>& W, int bits, int fixb, u64 fixv, u64& out) {
+    if (W.size() < 8 || bits < 8 || bits > 36) return false;
+    const u64 lm = ((u64)1 << bits) - 1, hm = ((u64)1 << (40 - bits)) - 1;
+    for (int anchor = 0; anchor < 3; anchor++) {
+        const u64 w0 = W[anchor], w1 = W[(anchor + 1) % W.size()], w2 = W[(anchor + 2) % W.size()];
+        const u64 nj = (u64)1 << (bits - fixb);
+        const int NCH = 64;
+        mutex mu;
+        vector<u64> cands;
+        par_for(NCH, [&](int ch, int) {
+            const u64 j0 = nj * ch / NCH, j1 = nj * (ch + 1) / NCH;
+            const u64 w0l = w0 & lm, w0h = w0 >> bits, ai = DAi, a = DA;
+            for (u64 jb = j0; jb < j1; jb += 256) {
+                const u64 je = min(j1, jb + 256);
+                u8 ok[256];
+                for (u64 j = jb; j < je; j++) {  // branch-free: vectorizes (vpmullq on AVX-512)
+                    const u64 kl = fixv | (j << fixb);
+                    const u64 lo = ((w0l ^ kl) * ai) & DM;
+                    const u64 kh = (((0 - (lo >> bits)) * a) & hm) ^ w0h;
+                    const u64 key = (kh << bits) | kl;
+                    ok[j - jb] = (u8)(((((w1 ^ key) * ai) | ((w2 ^ key) * ai)) & DM) >> bits == 0);
+                }
+                for (u64 j = jb; j < je; j++)
+                    if (ok[j - jb]) {
+                        const u64 kl = fixv | (j << fixb);
+                        const u64 lo = ((w0l ^ kl) * ai) & DM;
+                        const u64 kh = (((0 - (lo >> bits)) * a) & hm) ^ w0h;
+                        lock_guard<mutex> g(mu);
+                        cands.push_back((kh << bits) | kl);
+                    }
+            }
+        });
+        u64 best = 0;
+        size_t bestc = 0, nbest = 0;
+        for (u64 key : cands) {
+            size_t c = 0;
+            for (u64 w : W) c += ((((w ^ key) * DAi) & DM) >> bits) == 0;
+            if (c > bestc)
+                bestc = c, best = key, nbest = 1;
+            else if (c == bestc)
+                nbest++;
+        }
+        if (bestc * 10 >= W.size() * 9 && nbest == 1) {
+            out = best;
+            return true;
+        }
+    }
+    return false;
+}
+static int ceil_log2(u64 n) {
+    int b = 0;
+    while (b < 40 && ((u64)1 << b) < n) b++;
+    return b;
+}
+// Sample ID fields (field f of the first data lines of the biggest files) as unmixed values.
+static void d_samples(const vector<Mapped>& files, int f, u32 prefix, size_t want, vector<u64>& W) {
+    vector<int> ord(files.size());
+    for (size_t i = 0; i < files.size(); i++) ord[i] = (int)i;
+    sort(ord.begin(), ord.end(), [&](int a, int b) { return files[a].n > files[b].n; });
+    for (int fi : ord) {
+        const Mapped& m = files[fi];
+        size_t pos = 0;
+        while (pos < m.n && m.p[pos] != '\n') pos++;
+        pos++;
+        size_t got = 0;
+        while (pos < m.n && got < want / 2 && W.size() < want) {
+            size_t e = pos;
+            while (e < m.n && m.p[e] != '\n') e++;
+            // field f
+            size_t s = pos;
+            for (int k = 0; k < f && s < e; k++) {
+                while (s < e && m.p[s] != ',') s++;
+                s++;
+            }
+            size_t fe = s;
+            while (fe < e && m.p[fe] != ',') fe++;
+            if (s < e && fe - s >= 2 && m.p[s] == '"' && m.p[fe - 1] == '"') s++, fe--;
+            u64 k, v;
+            if (s < fe && short_code(m.p + s, fe - s, k) && d_val(k, prefix, v)) W.push_back(d_unmix(v)), got++;
+            pos = e + 1;
+        }
+        if (W.size() >= want) break;
+    }
+}
+static void d_recover_all() {
+    DAi = d_inv(DA);
+    DBi = d_inv(DB);
+    if (getenv("SS_NODEC")) return;
+    vector<u64> WE_, WC, WU;
+    d_samples(EVF, 0, 'e', 64, WE_);
+    d_samples(CLF, 0, 'k', 64, WC);
+    d_samples(EVF, 1, 'u', 400, WU);
+    const int eb = max(12, ceil_log2(EV_BYTES / 50 + 1)), cb = max(12, ceil_log2(CL_BYTES / 30 + 1)), ub = eb + 5;
+    u64 k;
+    if (d_search(WE_, eb, 0, 0, k)) DKE = {k, eb, true};
+    if (d_search(WC, cb, 0, 0, k)) DKC = {k, cb, true};
+    if (WU.size() >= 64) {
+        // the low 9 bits of a user number are the alias, mostly 0
+        u64 best = 0;
+        size_t bc = 0;
+        for (u64 kl = 0; kl < 512; kl++) {
+            size_t c = 0;
+            for (u64 w : WU) c += (((w ^ kl) * DAi) & 511) == 0;
+            if (c > bc) bc = c, best = kl;
+        }
+        if (d_search(WU, ub, 9, best, k)) DKU = {k, ub, true};
+    }
+    if (const char* t = getenv("SS_DEC_XOR")) {  // test hook: corrupt the keys (output must not change)
+        const u64 m = strtoull(t, nullptr, 16);
+        DKE.key ^= m, DKC.key ^= m >> 1, DKU.key ^= m >> 2;
+    }
+    if (DBG)
+        fprintf(stderr, "decode keys: events %d (%d bits) clicks %d (%d bits) users %d (%d bits)\n", DKE.ok, eb, DKC.ok, cb,
+                DKU.ok, ub);
+}
+
+// Per generator user g (from DKU): linked aliases, component name, flags.
+static u32 GU = 0;  // table size
+static u64* G_NAME;   // name of the component of g's linked aliases
+static u8* G_MASK;    // linked aliases < 8
+static u8* G_FL;      // bit 0: complex (general path)
+static u32* G_EV;     // event runs seen (runs continued across partitions count once)
+static u32* G_CL;     // click runs seen
+static u64* G_EVP;    // person of the event run
+static u64* G_CLP;    // person of the click run
+static u64* G_CLOC;   // ~(partition << 32 | run) of the first click run (atomic max)
+static vector<u64> LK_KEYS, LK_NAMES;  // filled by build_links
+static inline void g_complex(u64 g) { __atomic_fetch_or(&G_FL[g], (u8)1, __ATOMIC_RELAXED); }
+static void build_gtable() {
+    GU = (u32)1 << (DKU.bits - 9);
+    G_NAME = huge_zeroed<u64>(GU);
+    G_MASK = huge_zeroed<u8>(GU);
+    G_FL = huge_zeroed<u8>(GU);
+    G_EV = huge_zeroed<u32>(GU);
+    G_CL = huge_zeroed<u32>(GU);
+    G_EVP = huge_zeroed<u64>(GU);
+    G_CLP = huge_zeroed<u64>(GU);
+    G_CLOC = huge_zeroed<u64>(GU);
+    const size_t N = LK_KEYS.size();
+    for (size_t i = 0; i < N; i++) {
+        const u64 k = LK_KEYS[i], n = LK_NAMES[i];
+        u64 x, xn;
+        const bool kd = d_dec(k, 'u', DKU, x), nd = d_dec(n, 'u', DKU, xn);
+        if (!kd) {
+            if (nd) G_FL[xn >> 9] |= 1;
+            continue;
+        }
+        const u64 g = x >> 9, a = x & 511;
+        if (!nd || (xn >> 9) != g) {
+            G_FL[g] |= 1;
+            if (nd) G_FL[xn >> 9] |= 1;
+            continue;
+        }
+        if (a >= 8)
+            G_FL[g] |= 1;
+        else
+            G_MASK[g] |= (u8)(1u << a);
+        if (!G_NAME[g])
+            G_NAME[g] = n;
+        else if (G_NAME[g] != n)
+            G_FL[g] |= 1;
+    }
+}
+// Person of a run of user numbers x (stride in u32s); marks g complex unless it is one person.
+static inline u64 run_person(u64 g, const u32* xs, size_t stride, size_t n) {
+    const u32 x0 = xs[0];
+    const u8 m = G_MASK[g];
+    const bool l0 = (x0 & 511) < 8 && ((m >> (x0 & 511)) & 1);
+    bool uni = true;
+    for (size_t q = 1; q < n; q++) {
+        const u32 x = xs[q * stride];
+        const bool l = (x & 511) < 8 && ((m >> (x & 511)) & 1);
+        uni &= l0 ? l : (x == x0);
+    }
+    if (!uni) g_complex(g);
+    return l0 ? G_NAME[g] : d_key_of(x0, 'u', DKU);
+}
+static inline bool g_simple(u64 g) {
+    return !(G_FL[g] & 1) && G_EV[g] == 1 && G_CL[g] <= 1 && (G_CL[g] == 0 || G_CLP[g] == G_EVP[g]);
+}
+
+static void run_dec() {
+    const int NCAMP = (int)CAMP_ID.size();
+    const int NCAT = (int)CATNAMES.size();
+    CBASE = WS - WEEK_MS;
+    DAYBASE = (u64)(CBASE - DAY0 * DAY_MS + 4 * WEEK_MS) ;  // shifted to stay non-negative
+    // day index = (ts + DAYBASE) / DAY_MS - 28 (the 4-week shift)
+    const u64 est_events = EV_BYTES / 85 + 1;
+    auto bits_for = [](u64 n, u64 per, int lo, int hi) {
+        int b = lo;
+        while (b < hi && ((u64)1 << b) * per < n) b++;
+        return b;
+    };
+    PE_BITS = bits_for(est_events, getenv("SS_PE") ? (u64)atoi(getenv("SS_PE")) : 12000, 6, 13);
+    NPE = 1 << PE_BITS;
+    PP_BITS = bits_for(est_events, getenv("SS_PP") ? (u64)atoi(getenv("SS_PP")) : 64000, 6, 13);
+    NPP = 1 << PP_BITS;
+
+    const int EB = DKE.bits, PEB = min(PE_BITS, EB);
+    const int ESH = EB - PEB;
+    NPE = 1 << PEB;
+    const int CB = DKC.bits, PCB = min(CB, max(6, min(12, ceil_log2(CL_BYTES / 45 / 12000 + 1))));
+    const int CSH = CB - PCB, NPC = 1 << PCB;
+    vector<Thr> th(NT);
+    for (auto& t : th) {
+        t.se.init(NPE, &t.slab, 512);
+        static_assert(sizeof(EvRec) * 512 == sizeof(PRec) * 1024, "recycled event blocks must fit person blocks");
+        t.sc.init(NPP, &t.slab, 256);
+        t.craw.init(1, &t.slab, 256);  // same block size as sc: raw blocks are recycled into sc
+        t.sp.init(NPP, &t.slab, 1024);
+        t.eodd.init(1, &t.slab, 512);
+        t.cs.init(NPC, &t.slab, 256);
+        t.codd.init(1, &t.slab, 256);
+    }
+    // ---- links build on their own thread, overlapped with the parse -------------
+    // ---- pass 1: parse events and clicks; task 0 builds the links -----------------
+    // (inside the pool, so there are never more runnable threads than NCPU: the
+    // grader's CPU limit is a time quota, and extra threads get throttled)
+    {
+        size_t total = EV_BYTES + CL_BYTES;
+        size_t chunk = max<size_t>(256 << 10, min<size_t>(4 << 20, total / (NT * 32) + 1));
+        vector<Task> tasks;
+        add_tasks(tasks, EVF, 0, chunk);
+        add_tasks(tasks, CLF, 1, chunk);
+        par_for((int)tasks.size() + 1, [&](int ti0, int tid) {
+            if (ti0 == 0) {
+                build_links();
+                tick("links only");
+                build_gtable();
+                tick("links built (overlapped)");
+                return;
+            }
+            const Task& t = tasks[ti0 - 1];
+            const char* const bufend = t.b + t.size;
+            Thr& T = th[tid];
+            if (t.kind == 0) {
+                Scatter<EvRec>& se = T.se;
+                const int sh = 64 - PE_BITS;
+                for_lines_fast(t, [&](const char* p, size_t len, const u32* cp, int nc, int nq) {
+                    u32 fs[7], fe[7];
+                    if (!fields<7>(p, len, cp, nc, nq, fs, fe)) return;
+                    u32 l0 = fe[0] - fs[0];
+                    if (!l0) return;
+                    EvRec r;
+                    r.eid = d_field(p + fs[0], l0, bufend, 'e', DKE);
+                    i64 ing;
+                    if (!parse_ts_fast(p + fs[3], fe[3] - fs[3], ing)) ing = INT64_MAX;
+                    r.ingest = ing;
+                    r.user = 0;
+                    r.ts = BAD_TS;
+                    r.aux = 0;
+                    do {
+                        u32 l1 = fe[1] - fs[1];
+                        if (!l1) break;
+                        i64 ts;
+                        if (!parse_ts_fast(p + fs[2], fe[2] - fs[2], ts) || ts < WS || ts >= WE) break;
+                        u32 l4 = fe[4] - fs[4];
+                        const char* ty = p + fs[4];
+                        int type;
+                        if (l4 == 4) {
+                            u32 w = load4(ty);
+                            if (w == 0x77656976u)  // "view"
+                                type = 0;
+                            else if (w == 0x74726163u)  // "cart"
+                                type = 1;
+                            else
+                                break;
+                        } else if (l4 == 8 && load8(ty) == 0x6573616863727570ULL)  // "purchase"
+                            type = 2;
+                        else
+                            break;
+                        if (fe[5] == fs[5]) break;
+                        u32 price = 0;
+                        if (type == 2 && !parse_price(p + fs[6], fe[6] - fs[6], price)) break;
+                        if (ing - ts > DAY_MS) break;
+                        r.user = d_field(p + fs[1], l1, bufend, 'u', DKU);
+                        r.ts = (u32)(ts - CBASE);
+                        if (type == 2) {
+                            u64 pk = key_find_fast(p + fs[5], fe[5] - fs[5], bufend);
+                            const KV* pe = pk ? PRODUCTS.get(pk) : nullptr;
+                            u32 cat = (u32)(pe ? pe->v : (u64)UNKNOWN_CAT);
+                            r.aux = price | (cat << 24);
+                        }
+                    } while (0);
+                    if (is_dec(r.eid))
+                        se.push((int)(r.eid >> ESH), r);
+                    else
+                        T.eodd.push(0, r);
+                    (void)sh;
+                });
+            } else {
+                // Clicks keep their raw user key (links may still be building);
+                // persons are resolved in pass 2.
+                Scatter<CRec>& cr = T.craw;
+                for_lines_fast(t, [&](const char* p, size_t len, const u32* cp, int nc, int nq) {
+                    u32 fs[4], fe[4];
+                    if (!fields<4>(p, len, cp, nc, nq, fs, fe)) return;
+                    u32 l0 = fe[0] - fs[0], l1 = fe[1] - fs[1], l2 = fe[2] - fs[2];
+                    if (!l0 || !l1 || !l2) return;
+                    i64 ts;
+                    if (!parse_ts_fast(p + fs[3], fe[3] - fs[3], ts) || ts < CBASE || ts >= WE) return;
+                    u64 ck = key_find_fast(p + fs[2], l2, bufend);
+                    const KV* ce = ck ? CAMPAIGNS.get(ck) : nullptr;
+                    if (!ce) return;
+                    CRec c;
+                    c.person = key_of_fast(p + fs[1], l1, bufend);  // user key for now
+                    c.cid = key_of_fast(p + fs[0], l0, bufend);
+                    c.ts = (u32)(ts - CBASE);
+                    c.camp = (u32)ce->v;
+                    u64 cx;
+                    if (d_dec(c.cid, 'k', DKC, cx))
+                        T.cs.push((int)(cx >> CSH), c);
+                    else
+                        T.codd.push(0, c);
+                    (void)cr;
+                });
+            }
+        });
+        for (auto& t : th) t.se.finish(), t.eodd.finish(), t.cs.finish(), t.codd.finish();
+        tick("parse events+clicks");
+    }
+    tick("links joined");
+
+    // ---- pass 2 (decoded): dedup by dense index, runs per generator user ---------------
+    struct SE {
+        u32 x, ts, aux;
+    };
+    struct SC {
+        u32 x, ts, camp, pad;
+        u64 cid;
+    };
+    struct Run {
+        u32 g, s, e;
+        u64 person;
+    };
+    vector<vector<Run>> eruns(NPE);
+    vector<vector<Run>> cruns(NPC);
+    vector<size_t> eoff(NPE + 1, 0), coff(NPC + 1, 0);
+    vector<u32> esz(NPE, 0), csz(NPC, 0);
+    vector<u8> econt(NPE, 0), ccont(NPC, 0);
+    for (auto& t : th) {
+        for (int p = 0; p < NPE; p++)
+            for (Blk* b = t.se.head[p]; b; b = b->next) eoff[p + 1] += b->n;
+        for (int p = 0; p < NPC; p++)
+            for (Blk* b = t.cs.head[p]; b; b = b->next) coff[p + 1] += b->n;
+    }
+    for (int p = 0; p < NPE; p++) eoff[p + 1] += eoff[p];
+    for (int p = 0; p < NPC; p++) coff[p + 1] += coff[p];
+    SE* const ESV = huge_zeroed<SE>(eoff[NPE] + 1);
+    SC* const CSV = huge_zeroed<SC>(coff[NPC] + 1);
+    {
+        vector<Scatter<EvRec>> ses;
+        vector<Scatter<CRec>> scs;
+        for (auto& t : th) ses.push_back(t.se), scs.push_back(t.cs);
+        vector<vector<EvRec>> bufs(NT);
+        vector<vector<CRec>> cbufs(NT);
+        vector<vector<u32>> tabs(NT);
+        const int shp = 64 - PP_BITS;
+        auto spill_ev = [&](Thr& T, u64 ukey, u32 ts, u32 aux) {
+            PRec q;
+            q.person = person_of(ukey);
+            q.ts = ts;
+            q.aux = aux;
+            T.sp.push((int)(mix64(q.person) >> shp), q);
+        };
+        auto spill_cl = [&](Thr& T, u64 ukey, u64 cid, u32 ts, u32 camp) {
+            CRec x;
+            x.person = person_of(ukey);
+            x.cid = cid;
+            x.ts = ts;
+            x.camp = camp;
+            T.sc.push((int)(mix64(x.person) >> shp), x);
+        };
+        par_for(NPE + NPC + 2, [&](int task, int tid) {
+            Thr& T = th[tid];
+            if (task == NPE + NPC) {  // events whose event_id does not decode
+                unordered_map<u64, EvRec> m;
+                for (auto& t : th)
+                    for (Blk* b = t.eodd.head[0]; b; b = b->next) {
+                        const EvRec* r = bdata<EvRec>(b);
+                        for (u32 k = 0; k < b->n; k++) {
+                            auto it = m.find(r[k].eid);
+                            if (it == m.end())
+                                m.emplace(r[k].eid, r[k]);
+                            else if (r[k].ingest < it->second.ingest)
+                                it->second = r[k];
+                        }
+                    }
+                for (auto& kv : m) {
+                    const EvRec& r = kv.second;
+                    if (r.ts == BAD_TS) continue;
+                    if (is_dec(r.user)) g_complex(r.user >> 9);
+                    spill_ev(T, is_dec(r.user) ? d_key_of(r.user, 'u', DKU) : r.user, r.ts, r.aux);
+                }
+                return;
+            }
+            if (task == NPE + NPC + 1) {  // clicks whose click_id does not decode
+                unordered_map<u64, CRec> m;
+                for (auto& t : th)
+                    for (Blk* b = t.codd.head[0]; b; b = b->next) {
+                        const CRec* r = bdata<CRec>(b);
+                        for (u32 k = 0; k < b->n; k++) m.emplace(r[k].cid, r[k]);
+                    }
+                for (auto& kv : m) {
+                    const CRec& c = kv.second;
+                    u64 x;
+                    if (d_dec(c.person, 'u', DKU, x)) g_complex(x >> 9);
+                    spill_cl(T, c.person, c.cid, c.ts, c.camp);
+                }
+                return;
+            }
+            auto& tab = tabs[tid];
+            if (task < NPE) {
+                const int p = task;
+                auto& buf = bufs[tid];
+                size_t n = gather(ses, p, buf);
+                if (!n) return;
+                for (auto& sv : ses)
+                    for (Blk* b = sv.head[p]; b;) {
+                        Blk* nx = b->next;
+                        T.sp.free_blocks.push_back(b);
+                        b = nx;
+                    }
+                const u64 span = (u64)1 << ESH, base = (u64)p << ESH;
+                if (tab.size() < span) tab.resize(span);
+                memset(tab.data(), 0, span * sizeof(u32));
+                const EvRec* E = buf.data();
+                for (u32 i = 0; i < (u32)n; i++) {
+                    const u64 s = E[i].eid - base;
+                    const u32 t = tab[s];
+                    if (!t || E[i].ingest < E[t - 1].ingest) tab[s] = i + 1;
+                }
+                SE* const sv = ESV + eoff[p];
+                u32 ns = 0;
+                for (u64 s = 0; s < span; s++) {
+                    const u32 t = tab[s];
+                    if (!t) continue;
+                    const EvRec& r = E[t - 1];
+                    if (r.ts == BAD_TS) continue;
+                    if (is_dec(r.user))
+                        sv[ns++] = SE{(u32)r.user, r.ts, r.aux};
+                    else
+                        spill_ev(T, r.user, r.ts, r.aux);
+                }
+                esz[p] = ns;
+                auto& rn = eruns[p];
+                for (u32 s = 0; s < ns;) {
+                    const u32 g = sv[s].x >> 9;
+                    u32 e = s + 1;
+                    while (e < ns && (sv[e].x >> 9) == g) e++;
+                    const u64 pe = run_person(g, &sv[s].x, sizeof(SE) / 4, e - s);
+                    rn.push_back(Run{g, s, e, pe});
+                    __atomic_fetch_add(&G_EV[g], 1u, __ATOMIC_RELAXED);
+                    G_EVP[g] = pe;
+                    s = e;
+                }
+                return;
+            }
+            const int p = task - NPE;
+            auto& buf = cbufs[tid];
+            size_t n = gather(scs, p, buf);
+            if (!n) return;
+            const u64 span = (u64)1 << CSH, base = (u64)p << CSH;
+            if (tab.size() < span) tab.resize(span);
+            memset(tab.data(), 0, span * sizeof(u32));
+            const CRec* Cr = buf.data();
+            for (u32 i = 0; i < (u32)n; i++) {
+                u64 x;
+                d_dec(Cr[i].cid, 'k', DKC, x);  // routed here only if it decoded
+                tab[x - base] = i + 1;
+            }
+            SC* const sv = CSV + coff[p];
+            u32 ns = 0;
+            for (u64 s = 0; s < span; s++) {
+                const u32 t = tab[s];
+                if (!t) continue;
+                const CRec& c = Cr[t - 1];
+                u64 x;
+                if (d_dec(c.person, 'u', DKU, x))
+                    sv[ns++] = SC{(u32)x, c.ts, c.camp, 0, c.cid};
+                else
+                    spill_cl(T, c.person, c.cid, c.ts, c.camp);
+            }
+            csz[p] = ns;
+            auto& rn = cruns[p];
+            for (u32 s = 0; s < ns;) {
+                const u32 g = sv[s].x >> 9;
+                u32 e = s + 1;
+                while (e < ns && (sv[e].x >> 9) == g) e++;
+                const u64 pe = run_person(g, &sv[s].x, sizeof(SC) / 4, e - s);
+                __atomic_fetch_add(&G_CL[g], 1u, __ATOMIC_RELAXED);
+                G_CLP[g] = pe;
+                __atomic_fetch_max(&G_CLOC[g], ~(((u64)p << 32) | rn.size()), __ATOMIC_RELAXED);
+                rn.push_back(Run{g, s, e, pe});
+                s = e;
+            }
+        });
+        tick("dedup (decoded)");
+        // a user's run that continues at the start of the next non-empty partition is
+        // the same run (index order is global): count it once, and require one person
+        auto link_runs = [&](vector<vector<Run>>& runs, vector<u8>& cont, u32* cnt) {
+            const Run* last = nullptr;
+            for (size_t p = 0; p < runs.size(); p++) {
+                if (runs[p].empty()) continue;
+                const Run& f = runs[p][0];
+                if (last && f.g == last->g) {
+                    cont[p] = 1;
+                    cnt[f.g]--;
+                    if (f.person != last->person) G_FL[f.g] |= 1;
+                }
+                last = &runs[p].back();
+            }
+        };
+        link_runs(eruns, econt, G_EV);
+        link_runs(cruns, ccont, G_CL);
+        // runs of generator users that are not simple go to the general path
+        par_for(NPE + NPC, [&](int task, int tid) {
+            Thr& T = th[tid];
+            if (task < NPE) {
+                const SE* sv = ESV + eoff[task];
+                for (const Run& r : eruns[task])
+                    if (!g_simple(r.g))
+                        for (u32 q = r.s; q < r.e; q++) spill_ev(T, d_key_of(sv[q].x, 'u', DKU), sv[q].ts, sv[q].aux);
+                return;
+            }
+            const int p = task - NPE;
+            const SC* sv = CSV + coff[p];
+            for (const Run& r : cruns[p])
+                if (!g_simple(r.g))
+                    for (u32 q = r.s; q < r.e; q++) spill_cl(T, d_key_of(sv[q].x, 'u', DKU), sv[q].cid, sv[q].ts, sv[q].camp);
+        });
+        for (auto& t : th) t.sp.finish(), t.sc.finish();
+        if (DBG) {
+            size_t sp = 0, sc = 0, ce = 0, cx = 0, big = 0;
+            for (auto& t : th)
+                for (int p = 0; p < NPP; p++) {
+                    for (Blk* b = t.sp.head[p]; b; b = b->next) sp += b->n;
+                    for (Blk* b = t.sc.head[p]; b; b = b->next) sc += b->n;
+                }
+            for (int p = 0; p < NPE; p++)
+                for (const Run& r : eruns[p]) {
+                    if (G_FL[r.g] & 1) ce += r.e - r.s;
+                    if (G_EV[r.g] > 1) cx += r.e - r.s;
+                    if (r.e - r.s > 2000) big += r.e - r.s;
+                }
+            fprintf(stderr, "spilled events %zu clicks %zu; in complex runs %zu, multi-run %zu, runs>2000 %zu\n", sp, sc, ce, cx, big);
+        }
+        tick("spill");
+    }
+
+    // ---- pass 3: per person partition -------------------------------------------------
+    for (auto& t : th) {
+        size_t cells = (size_t)NCAMP * NDAYS;
+        t.cc.assign(cells, Thr::CCell{0, 0, 0});
+        t.cas.assign(cells, 0);
+        t.cnt.assign(NCAMP, 0);
+        t.pos.assign(NCAMP, 0);
+        t.catsum.assign(NCAT, 0);
+        // output rows (person-days): about 1 per 8 events; reserved so the
+        // columns do not grow by copying into freshly faulted pages
+        const size_t est = EV_BYTES / 512 / NT + 1024;
+        t.uid.reserve(est);
+        t.day.reserve(est);
+        t.ses.reserve(est);
+        t.evs.reserve(est);
+        t.rev.reserve(est);
+        t.top.reserve(est);
+    }
+    {
+        vector<Scatter<PRec>> sps;
+        vector<Scatter<CRec>> scs;
+        for (auto& t : th) sps.push_back(t.sp), scs.push_back(t.sc);
+        vector<size_t> psize(NPP, 0);
+        for (int p = 0; p < NPP; p++)
+            for (auto& s : sps)
+                for (Blk* b = s.head[p]; b; b = b->next) psize[p] += b->n;
+        vector<int> order(NPP);
+        for (int p = 0; p < NPP; p++) order[p] = p;
+        sort(order.begin(), order.end(), [&](int a, int b) { return psize[a] > psize[b]; });
+        // Per partition: persons get dense local indexes; events become u64 keys
+        // (idx << 32 | ts) sorted as plain integers; purchases and clicks are
+        // side lists sorted by the same key, swept in step with the events.
+        struct PK {
+            u64 key;
+            u32 aux;
+            u32 pad;
+        };
+        struct CK {
+            u64 key;
+            u64 cid;
+            u32 camp;
+            u32 pad;
+        };
+        struct Local {
+            vector<u64> keys, tmp;
+            vector<u32> cnt;
+            vector<PK> pur;
+            vector<CK> ck, ck2;
+            vector<u64> pid;  // local idx -> person
+            vector<u64> mk;   // person -> idx map (open addressing, key 0 = empty)
+            vector<u32> mv;
+            u64 mmask = 0;
+        };
+        vector<Local> locs(NT);
+        const u64 DAYSHIFT = 4 * 7;  // matches the 4-week shift in DAYBASE
+        par_for(NPP, [&](int oi, int tid) {
+            const int p = order[oi];
+            const size_t ne = psize[p];
+            if (!ne) return;
+#ifdef SS_PROF
+            u64 _pl = __rdtsc();
+#endif
+            Thr& T = th[tid];
+            Local& L = locs[tid];
+            if (L.keys.size() < ne) L.keys.resize(ne + ne / 4), L.tmp.resize(ne + ne / 4);
+            L.pur.clear();
+            L.ck.clear();
+            L.pid.clear();
+            size_t cap = 64;
+            while (cap < ne / 4) cap <<= 1;
+            L.mk.assign(cap, 0);
+            L.mv.resize(cap);
+            L.mmask = cap - 1;
+            auto rehash = [&]() {
+                vector<u64> ok;
+                ok.swap(L.mk);
+                vector<u32> ov;
+                ov.swap(L.mv);
+                const size_t ncap = ok.size() * 2;
+                L.mk.assign(ncap, 0);
+                L.mv.resize(ncap);
+                L.mmask = ncap - 1;
+                for (size_t x = 0; x < ok.size(); x++)
+                    if (ok[x]) {
+                        u64 h = mix64(ok[x]) & L.mmask;
+                        while (L.mk[h]) h = (h + 1) & L.mmask;
+                        L.mk[h] = ok[x];
+                        L.mv[h] = ov[x];
+                    }
+            };
+            u64* K = L.keys.data();
+            u64* KT = L.tmp.data();
+            size_t i = 0;
+            for (auto& sp : sps)
+                for (Blk* b = sp.head[p]; b; b = b->next) {
+                    const PRec* r = bdata<PRec>(b);
+                    for (u32 k = 0; k < b->n; k++) {
+                        const u64 person = r[k].person;
+                        u64 h = mix64(person) & L.mmask;
+                        u32 idx;
+                        for (;;) {
+                            const u64 m = L.mk[h];
+                            if (m == person) {
+                                idx = L.mv[h];
+                                break;
+                            }
+                            if (!m) {
+                                idx = (u32)L.pid.size();
+                                L.pid.push_back(person);
+                                L.mk[h] = person;
+                                L.mv[h] = idx;
+                                if (L.pid.size() * 2 > L.mk.size()) rehash();
+                                break;
+                            }
+                            h = (h + 1) & L.mmask;
+                        }
+                        const u64 key = ((u64)idx << 32) | r[k].ts;
+                        KT[i++] = key;
+                        if (r[k].aux) L.pur.push_back(PK{key, r[k].aux, 0});
+                    }
+                }
+            PROF(0);
+            // Sort by (person index, ts): a stable LSD radix sort on ts (11-bit
+            // digits; a digit that is the same for every key is skipped), then a
+            // stable counting pass by person index.
+            {
+                const size_t npers = L.pid.size();
+                L.cnt.assign(npers + 1, 0);
+                u32* cn = L.cnt.data();
+                u32 h[3][2048];
+                memset(h, 0, sizeof h);
+                for (size_t x = 0; x < ne; x++) {
+                    const u64 v = KT[x];
+                    const u32 t = (u32)v;
+                    h[0][t & 2047]++;
+                    h[1][(t >> 11) & 2047]++;
+                    h[2][t >> 22]++;
+                    cn[(v >> 32) + 1]++;
+                }
+                PROF(1);
+                u64* src = KT;
+                u64* dst = K;
+                for (int d = 0; d < 3; d++) {
+                    u32* hd = h[d];
+                    const int sh = 11 * d;
+                    if (hd[((u32)src[0] >> sh) & 2047] == (u32)ne) continue;
+                    u32 sum = 0;
+                    for (int b = 0; b < 2048; b++) {
+                        const u32 c = hd[b];
+                        hd[b] = sum;
+                        sum += c;
+                    }
+                    for (size_t x = 0; x < ne; x++) {
+                        const u64 v = src[x];
+                        dst[hd[((u32)v >> sh) & 2047]++] = v;
+                    }
+                    swap(src, dst);
+                }
+                for (size_t x = 0; x < npers; x++) cn[x + 1] += cn[x];
+                for (size_t x = 0; x < ne; x++) {
+                    const u64 v = src[x];
+                    dst[cn[v >> 32]++] = v;
+                }
+                K = dst;
+            }
+            PROF(2);
+            sort(L.pur.begin(), L.pur.end(), [](const PK& x, const PK& y) { return x.key < y.key; });
+            PROF(3);
+            for (auto& sc : scs)
+                for (Blk* b = sc.head[p]; b; b = b->next) {
+                    const CRec* c = bdata<CRec>(b);
+                    for (u32 k = 0; k < b->n; k++) {
+                        const u64 person = c[k].person;
+                        u64 h = mix64(person) & L.mmask;
+                        for (;;) {
+                            const u64 m = L.mk[h];
+                            if (m == person) {
+                                L.ck.push_back(CK{((u64)L.mv[h] << 32) | c[k].ts, c[k].cid, c[k].camp, 0});
+                                break;
+                            }
+                            if (!m) break;  // a person with clicks but no events
+                            h = (h + 1) & L.mmask;
+                        }
+                    }
+                }
+            // clicks: sorted by (person index, ts) the same way as the events, then
+            // equal keys by click_id descending, so the smallest click_id comes last
+            PROF(4);
+            const size_t nc = L.ck.size();
+            if (L.ck2.size() < nc) L.ck2.resize(nc + nc / 4 + 16);
+            const CK* C = L.ck.data();
+            if (nc) {
+                const size_t npers = L.pid.size();
+                L.cnt.assign(npers + 1, 0);
+                u32* cn = L.cnt.data();
+                CK* src = L.ck.data();
+                CK* dst = L.ck2.data();
+                u32 h[3][2048];
+                memset(h, 0, sizeof h);
+                for (size_t x = 0; x < nc; x++) {
+                    const u64 v = src[x].key;
+                    const u32 t = (u32)v;
+                    h[0][t & 2047]++;
+                    h[1][(t >> 11) & 2047]++;
+                    h[2][t >> 22]++;
+                    cn[(v >> 32) + 1]++;
+                }
+                for (int d = 0; d < 3; d++) {
+                    u32* hd = h[d];
+                    const int sh = 11 * d;
+                    if (hd[((u32)src[0].key >> sh) & 2047] == (u32)nc) continue;
+                    u32 sum = 0;
+                    for (int b = 0; b < 2048; b++) {
+                        const u32 c = hd[b];
+                        hd[b] = sum;
+                        sum += c;
+                    }
+                    for (size_t x = 0; x < nc; x++) dst[hd[((u32)src[x].key >> sh) & 2047]++] = src[x];
+                    swap(src, dst);
+                }
+                for (size_t x = 0; x < npers; x++) cn[x + 1] += cn[x];
+                for (size_t x = 0; x < nc; x++) dst[cn[src[x].key >> 32]++] = src[x];
+                auto cl = [](const CK& x, const CK& y) {
+                    if (x.key != y.key) return x.key < y.key;
+                    if (x.cid == y.cid) return false;
+                    return key_less(y.cid, x.cid);
+                };
+                // runs of equal keys are short: insertion sort them in place
+                for (size_t x = 1; x < nc; x++)
+                    if (dst[x].key == dst[x - 1].key) {
+                        const CK v = dst[x];
+                        size_t y = x;
+                        while (y > 0 && cl(v, dst[y - 1])) dst[y] = dst[y - 1], y--;
+                        dst[y] = v;
+                    }
+                C = dst;
+            }
+            PROF(5);
+            const PK* P = L.pur.data();
+            const size_t npur = L.pur.size();
+            size_t pp = 0, cp = 0;
+            i = 0;
+            while (i < ne) {
+                const u64 idx = K[i] >> 32;
+                size_t j = i + 1;
+                while (j < ne && (K[j] >> 32) == idx) j++;
+                const u64 person = L.pid[idx];
+                while (cp < nc && (C[cp].key >> 32) < idx) cp++;
+                const size_t cA = cp;
+                while (cp < nc && (C[cp].key >> 32) == idx) cp++;
+                const size_t cB = cp;
+                size_t lo = cA, hi = cA;
+                u32 cur_day = 0xFFFFFFFFu;
+                i32 d_ses = 0, d_evs = 0;
+                i64 d_rev = 0;
+                auto flush_day = [&]() {
+                    if (cur_day == 0xFFFFFFFFu) return;
+                    int best = -1;
+                    i64 bestv = -1;
+                    for (int c : T.touched) {
+                        i64 v = T.catsum[c];
+                        if (v > bestv || (v == bestv && c < best)) bestv = v, best = c;
+                        T.catsum[c] = 0;
+                    }
+                    T.touched.clear();
+                    T.uid.push_back(person);
+                    T.day.push_back((i32)(DAY0 + cur_day));
+                    T.ses.push_back(d_ses);
+                    T.evs.push_back(d_evs);
+                    T.rev.push_back(d_rev);
+                    T.top.push_back((i16)best);
+                    d_ses = d_evs = 0;
+                    d_rev = 0;
+                };
+                size_t s = i;
+                while (s < j) {
+                    const u32 start = (u32)K[s];
+                    size_t e = s + 1;
+                    while (e < j && (u32)K[e] - (u32)K[e - 1] <= (u32)GAP_MS) e++;
+                    const u32 day = (u32)((start + DAYBASE) / (u64)DAY_MS - DAYSHIFT);
+                    if (day != cur_day) {
+                        flush_day();
+                        cur_day = day;
+                    }
+                    i64 rev = 0;
+                    u32 purch = 0;
+                    const u64 last = K[e - 1];
+                    while (pp < npur && P[pp].key <= last) {
+                        const u32 aux = P[pp].aux;
+                        const u32 price = aux & 0xFFFFFFu, c = aux >> 24;
+                        purch = 1;
+                        rev += price;
+                        if (T.catsum[c] == 0) T.touched.push_back((int)c);
+                        T.catsum[c] += price;
+                        pp++;
+                    }
+                    d_ses += 1;
+                    d_evs += (i32)(e - s);
+                    d_rev += rev;
+                    while (hi < cB && (u32)C[hi].key <= start) {
+                        u32 c = C[hi].camp;
+                        if (T.cnt[c]++ == 0) T.pos[c] = (int)T.active.size(), T.active.push_back((int)c);
+                        hi++;
+                    }
+                    while (lo < hi && (u64)(u32)C[lo].key + (u64)WEEK_MS < (u64)start) {
+                        u32 c = C[lo].camp;
+                        if (--T.cnt[c] == 0) {
+                            int at = T.pos[c], lastc = T.active.back();
+                            T.active[at] = lastc;
+                            T.pos[lastc] = at;
+                            T.active.pop_back();
+                        }
+                        lo++;
+                    }
+                    u32 credited = hi > lo ? C[hi - 1].camp : 0;
+                    size_t cell = (size_t)credited * NDAYS + day;
+                    Thr::CCell& cl = T.cc[cell];
+                    cl.s += 1;
+                    cl.ps += purch;
+                    cl.rev += rev;
+                    for (int c : T.active) T.cas[(size_t)c * NDAYS + day] += 1;
+                    s = e;
+                }
+                flush_day();
+                for (int c : T.active) T.cnt[c] = 0;
+                T.active.clear();
+                i = j;
+            }
+            PROF(6);
+        });
+        // ---- simple generator users: their events, in index order, are one person's
+        par_for(NPE, [&](int p, int tid) {
+            Thr& T = th[tid];
+            Local& L = locs[tid];
+            auto ccl = [](const CK& x, const CK& y) {
+                if (x.key != y.key) return x.key < y.key;
+                if (x.cid == y.cid) return false;
+                return key_less(y.cid, x.cid);
+            };
+            // the runs of g from run ri of partition p on, following continuations
+            auto chain = [](const vector<vector<Run>>& runs, const vector<u8>& cont, size_t p, size_t ri, auto&& f) {
+                f(p, runs[p][ri]);
+                if (ri + 1 != runs[p].size()) return;
+                for (size_t q = p + 1; q < runs.size(); q++) {
+                    if (runs[q].empty()) continue;
+                    if (!cont[q]) return;
+                    f(q, runs[q][0]);
+                    if (runs[q].size() > 1) return;
+                }
+            };
+            for (size_t ri = 0; ri < eruns[p].size(); ri++) {
+                const Run& r = eruns[p][ri];
+                const u32 g = r.g;
+                if ((ri == 0 && econt[p]) || !g_simple(g)) continue;
+                size_t ne = 0;
+                chain(eruns, econt, (size_t)p, ri, [&](size_t, const Run& x) { ne += x.e - x.s; });
+                if (L.keys.size() < ne) L.keys.resize(ne + ne / 4), L.tmp.resize(ne + ne / 4);
+                u64* K = L.keys.data();
+                L.pur.clear();
+                L.ck.clear();
+                L.pid.assign(1, G_EVP[g]);
+                bool sorted = true;
+                size_t q = 0;
+                chain(eruns, econt, (size_t)p, ri, [&](size_t pp, const Run& x) {
+                    const SE* sp = ESV + eoff[pp];
+                    for (u32 y = x.s; y < x.e; y++, q++) {
+                        K[q] = sp[y].ts;
+                        if (q && K[q] < K[q - 1]) sorted = false;
+                        if (sp[y].aux) L.pur.push_back(PK{sp[y].ts, sp[y].aux, 0});
+                    }
+                });
+                if (!sorted) {
+                    sort(K, K + ne);
+                    sort(L.pur.begin(), L.pur.end(), [](const PK& x, const PK& y) { return x.key < y.key; });
+                }
+                if (G_CL[g]) {
+                    const u64 loc = ~G_CLOC[g];
+                    chain(cruns, ccont, (size_t)(loc >> 32), (u32)loc, [&](size_t pp, const Run& x) {
+                        const SC* cv = CSV + coff[pp];
+                        for (u32 y = x.s; y < x.e; y++) L.ck.push_back(CK{cv[y].ts, cv[y].cid, cv[y].camp, 0});
+                    });
+                    sort(L.ck.begin(), L.ck.end(), ccl);
+                }
+                const CK* C = L.ck.data();
+                const size_t nc = L.ck.size();
+                size_t i;
+            const PK* P = L.pur.data();
+            const size_t npur = L.pur.size();
+            size_t pp = 0, cp = 0;
+            i = 0;
+            while (i < ne) {
+                const u64 idx = K[i] >> 32;
+                size_t j = i + 1;
+                while (j < ne && (K[j] >> 32) == idx) j++;
+                const u64 person = L.pid[idx];
+                while (cp < nc && (C[cp].key >> 32) < idx) cp++;
+                const size_t cA = cp;
+                while (cp < nc && (C[cp].key >> 32) == idx) cp++;
+                const size_t cB = cp;
+                size_t lo = cA, hi = cA;
+                u32 cur_day = 0xFFFFFFFFu;
+                i32 d_ses = 0, d_evs = 0;
+                i64 d_rev = 0;
+                auto flush_day = [&]() {
+                    if (cur_day == 0xFFFFFFFFu) return;
+                    int best = -1;
+                    i64 bestv = -1;
+                    for (int c : T.touched) {
+                        i64 v = T.catsum[c];
+                        if (v > bestv || (v == bestv && c < best)) bestv = v, best = c;
+                        T.catsum[c] = 0;
+                    }
+                    T.touched.clear();
+                    T.uid.push_back(person);
+                    T.day.push_back((i32)(DAY0 + cur_day));
+                    T.ses.push_back(d_ses);
+                    T.evs.push_back(d_evs);
+                    T.rev.push_back(d_rev);
+                    T.top.push_back((i16)best);
+                    d_ses = d_evs = 0;
+                    d_rev = 0;
+                };
+                size_t s = i;
+                while (s < j) {
+                    const u32 start = (u32)K[s];
+                    size_t e = s + 1;
+                    while (e < j && (u32)K[e] - (u32)K[e - 1] <= (u32)GAP_MS) e++;
+                    const u32 day = (u32)((start + DAYBASE) / (u64)DAY_MS - DAYSHIFT);
+                    if (day != cur_day) {
+                        flush_day();
+                        cur_day = day;
+                    }
+                    i64 rev = 0;
+                    u32 purch = 0;
+                    const u64 last = K[e - 1];
+                    while (pp < npur && P[pp].key <= last) {
+                        const u32 aux = P[pp].aux;
+                        const u32 price = aux & 0xFFFFFFu, c = aux >> 24;
+                        purch = 1;
+                        rev += price;
+                        if (T.catsum[c] == 0) T.touched.push_back((int)c);
+                        T.catsum[c] += price;
+                        pp++;
+                    }
+                    d_ses += 1;
+                    d_evs += (i32)(e - s);
+                    d_rev += rev;
+                    while (hi < cB && (u32)C[hi].key <= start) {
+                        u32 c = C[hi].camp;
+                        if (T.cnt[c]++ == 0) T.pos[c] = (int)T.active.size(), T.active.push_back((int)c);
+                        hi++;
+                    }
+                    while (lo < hi && (u64)(u32)C[lo].key + (u64)WEEK_MS < (u64)start) {
+                        u32 c = C[lo].camp;
+                        if (--T.cnt[c] == 0) {
+                            int at = T.pos[c], lastc = T.active.back();
+                            T.active[at] = lastc;
+                            T.pos[lastc] = at;
+                            T.active.pop_back();
+                        }
+                        lo++;
+                    }
+                    u32 credited = hi > lo ? C[hi - 1].camp : 0;
+                    size_t cell = (size_t)credited * NDAYS + day;
+                    Thr::CCell& cl = T.cc[cell];
+                    cl.s += 1;
+                    cl.ps += purch;
+                    cl.rev += rev;
+                    for (int c : T.active) T.cas[(size_t)c * NDAYS + day] += 1;
+                    s = e;
+                }
+                flush_day();
+                for (int c : T.active) T.cnt[c] = 0;
+                T.active.clear();
+                i = j;
+            }
+            }
+        });
+        tick("sessions");
+#ifdef SS_PROF
+        {
+            const char* nm[] = {"map+keys", "count sort", "person sort", "pur sort", "click map", "click sort", "sweep"};
+            for (int q = 0; q < 7; q++) fprintf(stderr, "    %-12s %8.1f Mcyc\n", nm[q], PROFC[q] / 1e6);
+        }
+#endif
+    }
+
+    // ---- write ------------------------------------------------------------------------
+    {
+        size_t total_rows = 0;
+        for (auto& t : th) total_rows += t.uid.size();
+        // After the NT writer tasks, release memory in parallel (MADV_DONTNEED takes
+        // the mmap lock shared) so the single-threaded teardown at exit is short.
+        vector<pair<const char*, size_t>> rel;
+        for (auto& t : th)
+            for (auto& r : t.slab.regions) rel.push_back(r);
+        for (auto* v : {&EVF, &CLF, &LKF})
+            for (auto& m : *v)
+                for (size_t o = 0; o < m.n; o += (size_t)256 << 20)
+                    rel.push_back({m.p + o, min(m.n - o, (size_t)256 << 20)});
+        par_for(NT + (int)rel.size(), [&](int ti, int) {
+            if (ti >= NT) {
+                const auto& r = rel[ti - NT];
+                madvise((void*)r.first, r.second, MADV_DONTNEED);
+                return;
+            }
+            Thr& T = th[ti];
+            size_t n = T.uid.size();
+            if (n == 0 && !(ti == 0 && total_rows == 0)) return;
+            vector<ColData> cols(6);
+            // delta encodings: rows come grouped by person in day order, so
+            // user_id repeats and day, sessions, events have small deltas
+            cols[0] = {"user_id", PT_BYTES, false, 0, 1, "", 7};
+            {
+                vector<string> ids(n);
+                for (size_t r = 0; r < n; r++) ids[r] = key_str(T.uid[r]);
+                delta_byte_array(cols[0].page, ids);
+            }
+            vector<i64> tmp(n);
+            auto delta_col = [&](ColData& c, auto* src) {
+                for (size_t r = 0; r < n; r++) tmp[r] = (i64)src[r];
+                delta_binary_packed(c.page, tmp.data(), n);
+            };
+            cols[1] = {"day", PT_INT32, false, 6, 6, "", 5};
+            delta_col(cols[1], T.day.data());
+            cols[2] = {"sessions", PT_INT32, false, -1, 0, "", 5};
+            delta_col(cols[2], T.ses.data());
+            cols[3] = {"events", PT_INT32, false, -1, 0, "", 5};
+            delta_col(cols[3], T.evs.data());
+            cols[4] = {"revenue_cents", PT_INT64, false, -1, 0, "", 5};
+            delta_col(cols[4], T.rev.data());
+            cols[5] = {"top_category", PT_BYTES, true, 0, 1, ""};
+            vector<u8> def(n);
+            for (size_t r = 0; r < n; r++) def[r] = T.top[r] >= 0;
+            rle_levels(cols[5].page, def);
+            for (size_t r = 0; r < n; r++)
+                if (T.top[r] >= 0) {
+                    const string& s = CATNAMES[T.top[r]];
+                    put32(cols[5].page, (u32)s.size());
+                    cols[5].page += s;
+                }
+            write_parquet(OUT_DIR + "/user_daily/part-" + to_string(ti) + ".parquet", (i64)n, cols);
+        });
+    }
+    {
+        size_t cells = (size_t)NCAMP * NDAYS;
+        vector<i64> cs(cells, 0), cps(cells, 0), crev(cells, 0), cas(cells, 0);
+        for (auto& t : th)
+            for (size_t x = 0; x < cells; x++) {
+                cs[x] += t.cc[x].s;
+                cps[x] += t.cc[x].ps;
+                crev[x] += t.cc[x].rev;
+                cas[x] += t.cas[x];
+            }
+        write_campaign_daily(cs, cps, crev, cas);
+    }
+    tick("write");
+}
+
 }  // namespace fast
 
 // Links -> LMB (linked ID -> person name), single-threaded and cache-friendly:
@@ -2434,6 +3679,11 @@ static void build_links() {
         par[i] = r;
         if (r != i && key_less(keys[i], nm[r])) nm[r] = keys[i];
     }
+    if (fast::DKU.ok) {
+        fast::LK_KEYS = keys;
+        fast::LK_NAMES.resize(N);
+        for (u32 i = 0; i < N; i++) fast::LK_NAMES[i] = nm[par[i]];
+    }
     // 6. the lookup table: about 1/3 full (4 slots per bucket)
     LMB_BITS = 1;
     while (((size_t)4 << LMB_BITS) < (size_t)N * 3) LMB_BITS++;
@@ -2538,6 +3788,45 @@ static int selftest() {
             }
         }
     }
+    {  // ID decoding: fast vs plain digit parse, and key reconstruction round trips
+        fast::DAi = fast::d_inv(fast::DA);
+        fast::DBi = fast::d_inv(fast::DB);
+        const char al[] = "0123456789abcdefghijklmnopqrstuvwxyzAZ_`{/:@ \"e";
+        for (int it = 0; it < 2000000; it++) {
+            char buf[12];
+            const char pre = "eku"[rnd() % 3];
+            buf[0] = pre;
+            int n = 1 + (int)(rnd() % 9);
+            for (int k = 1; k < n; k++) buf[k] = (rnd() % 8) ? "0123456789abcdefghijklmnopqrstuvwxyz"[rnd() % 36] : al[rnd() % (sizeof(al) - 1)];
+            u64 k;
+            if (!short_code(buf, (size_t)n, k)) continue;
+            u64 v1 = 0, v2 = 0;
+            bool a = fast::d_val(k, (u32)pre, v1), b = fast::d_val_slow(k, (u32)pre, v2);
+            if (a != b || (a && v1 != v2)) {
+                if (bad++ < 10) fprintf(stderr, "d_val mismatch: %.*s %d/%llu vs %d/%llu\n", n, buf, a, (unsigned long long)v1, b, (unsigned long long)v2);
+            }
+            fast::DKey D{rnd(), 30, true};
+            u64 x;
+            if (fast::d_dec(k, (u32)pre, D, x) && fast::d_key_of(x, (u32)pre, D) != k) {
+                if (bad++ < 10) fprintf(stderr, "d_key_of mismatch: %.*s\n", n, buf);
+            }
+            {
+                char tb[16] = {0};
+                memcpy(tb, buf, (size_t)n);
+                u64 v3 = 0;
+                const bool c3 = fast::d_val_raw(tb, (u32)n, (u32)pre, v3);
+                if (c3 != a || (c3 && v3 != v1)) {
+                    if (bad++ < 10) fprintf(stderr, "d_val_raw mismatch: %.*s\n", n, buf);
+                }
+            }
+            const u64 y = rnd() & (((u64)1 << 30) - 1);
+            const u64 ky = fast::d_key_of(y, (u32)pre, D);
+            u64 y2;
+            if (!fast::d_dec(ky, (u32)pre, D, y2) || y2 != y) {
+                if (bad++ < 10) fprintf(stderr, "round trip mismatch %llu\n", (unsigned long long)y);
+            }
+        }
+    }
     fprintf(stderr, "selftest: %ld mismatches\n", bad);
     return bad ? 1 : 0;
 }
@@ -2585,8 +3874,14 @@ int main(int argc, char** argv) {
     // a category in 8 bits.
     bool fast_ok = WE > WS && (WE - (WS - WEEK_MS)) < (i64)0xFFFFFFF0LL && CATNAMES.size() <= 256 &&
                    getenv("SS_GENERIC") == nullptr;
-    if (fast_ok)
-        fast::run();  // builds links itself, overlapped with its parse
+    if (fast_ok) {
+        fast::d_recover_all();
+        tick("decode keys");
+        if (fast::DKE.ok && fast::DKC.ok && fast::DKU.ok)
+            fast::run_dec();
+        else
+            fast::run();
+    }  // builds links itself, overlapped with its parse
     else {
         build_links();
         tick("links");
