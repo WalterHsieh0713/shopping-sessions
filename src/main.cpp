@@ -316,15 +316,15 @@ struct DateEnt {
     u32 k2;  // bytes 8..9  "DD" (+1 in bit 16 to mark a used slot)
     i32 days;
 };
-// Direct-mapped by (year % 4, month digits, day digits); a slot holds at most one
-// date of the +-70-day range, and the full 10-byte key is always compared.
-static const int DT_N = 4 * 26 * 46;
-static DateEnt DATES[DT_N];
+// Direct-mapped by (month digits, day digits): the +-70-day range is shorter
+// than a year, so a slot holds at most one of its dates, and the full 10-byte
+// key is always compared. 1196 slots (19 KB) stay in L1.
+static const int DT_N = 26 * 46;
+alignas(64) static DateEnt DATES[DT_N];
 static inline u32 date_index(const char* p) {
-    u32 y = (u8)p[3] & 3;
     u32 mo = ((u8)p[5] & 1) * 10 + ((u8)p[6] & 15);
     u32 dd = ((u8)p[8] & 3) * 10 + ((u8)p[9] & 15);
-    return (y * 26 + mo) * 46 + dd;
+    return mo * 46 + dd;
 }
 static inline u64 ld8(const char* p) {
     u64 v;
@@ -1363,13 +1363,24 @@ static i64 CBASE;
 static u64 DAYBASE;  // day index = (ts + DAYBASE) / DAY_MS for event times
 static int PE_BITS, NPE, PP_BITS, NPP;
 
+// One event copy. Valid purchases are scattered separately as PurRec (with
+// their price and category), so the common record is 24 bytes.
 struct EvRec {
     u64 eid;
     u64 user;
-    i64 ingest;
     u32 ts;   // BAD_TS = invalid copy
-    u32 aux;  // purchase: price | cat << 24; else 0
+    u32 ing;  // ingest_ts in seconds - IBASE_S; NO_ING = not a valid timestamp
 };
+struct PurRec {
+    EvRec e;
+    u32 aux;  // price | cat << 24
+    u32 pad;
+};
+static const u32 NO_ING = 0xFFFFFFFFu;
+static i64 IBASE_S;
+// An ingest_ts this record cannot hold exactly (not whole seconds, or more than
+// 68 years from the window): the fast path gives up and generic::run runs.
+static atomic<bool> NEED_GENERIC(false);
 struct PRec {
     u64 person;
     u32 ts;
@@ -1381,7 +1392,7 @@ struct CRec {
     u32 ts;
     u32 camp;
 };
-static_assert(sizeof(EvRec) == 32 && sizeof(PRec) == 16 && sizeof(CRec) == 24, "record sizes");
+static_assert(sizeof(EvRec) == 24 && sizeof(PurRec) == 32 && sizeof(PRec) == 16 && sizeof(CRec) == 24, "record sizes");
 
 // ---- memory: per-thread slabs and block lists ----------------------------------
 struct Slab {
@@ -1407,10 +1418,7 @@ static void* slab_alloc(Slab& s, size_t n) {
     s.left -= n;
     return r;
 }
-#ifndef SS_STG
-#define SS_STG 2
-#endif
-struct alignas(32 * SS_STG < 64 ? 64 : 32 * SS_STG) Blk {  // block data aligned to a whole staging buffer
+struct alignas(64) Blk {  // block data starts on a cache line
     Blk* next;
     u32 n;
     u32 pad;
@@ -1425,18 +1433,20 @@ struct Scatter {
     u32 brec = 0;
     Slab* slab = nullptr;
     struct CE {
-        R* cur;
-        R* end;
+        R* base;  // current block's records
+        u32 n;    // records written to it
+        u32 cap;  // its capacity (brec)
     };
-    vector<CE> ce;  // write pointer and block end, together in one line
+    vector<CE> ce;  // per partition, in one 16-byte entry
     vector<Blk*> head, tail;
-    // 32-byte records are staged per partition in a cache line and written to
-    // the block a whole line at a time with a non-temporal store: no
-    // read-for-ownership of the (thousands of scattered) destination lines.
-    // cur advances per record; its parity (block data is line aligned) tells
-    // which half of the staging line the record goes to.
-    static constexpr bool NT = sizeof(R) == 32;
-    static constexpr int S = SS_STG;  // records staged per partition, streamed together
+    // 24- and 32-byte records are staged per partition in whole cache lines
+    // (8 x 24 = 3 lines, 2 x 32 = 1 line) and written to the block with
+    // non-temporal stores: no read-for-ownership of the (thousands of
+    // scattered) destination lines. Blocks hold a multiple of S records and
+    // start on a line, so a full staging group is always line aligned.
+    static constexpr bool NT = sizeof(R) == 32 || sizeof(R) == 24;
+    static constexpr int S = sizeof(R) == 24 ? 8 : 2;
+    static constexpr int LINES = (int)(S * sizeof(R) / 64);
     struct alignas(64) Line {
         R r[S];
     };
@@ -1445,12 +1455,14 @@ struct Scatter {
         np = np_;
         slab = s;
         brec = recs;
+        if (NT && recs % S) die("scatter block size");
         if (NT) stg.assign(np, Line{});
-        ce.assign(np, CE{nullptr, nullptr});
+        ce.assign(np, CE{nullptr, 0, 0});
         head.assign(np, nullptr);
         tail.assign(np, nullptr);
     }
     vector<Blk*> free_blocks;  // recycled blocks of exactly this block size
+    size_t block_bytes() const { return sizeof(Blk) + (size_t)brec * sizeof(R); }
     __attribute__((noinline)) void grow(int p) {
         if (tail[p]) tail[p]->n = brec;
         Blk* b;
@@ -1458,7 +1470,7 @@ struct Scatter {
             b = free_blocks.back();
             free_blocks.pop_back();
         } else
-            b = (Blk*)slab_alloc(*slab, sizeof(Blk) + (size_t)brec * sizeof(R));
+            b = (Blk*)slab_alloc(*slab, block_bytes());
         b->next = nullptr;
         b->n = 0;
         if (tail[p])
@@ -1466,54 +1478,43 @@ struct Scatter {
         else
             head[p] = b;
         tail[p] = b;
-        ce[p].cur = bdata<R>(b);
-        ce[p].end = ce[p].cur + brec;
+        ce[p] = CE{bdata<R>(b), 0, brec};
     }
     inline void push(int p, const R& r) {
+        CE& e = ce[p];
+        if (__builtin_expect(e.n == e.cap, 0)) grow(p);  // with NT, only at a group start
         if constexpr (NT) {
-            R* c = ce[p].cur;
-            const u32 i = (u32)((uintptr_t)c >> 5) & (S - 1);
-            if (__builtin_expect(c == ce[p].end, 0)) {  // only ever at i == 0
-                grow(p);
-                c = ce[p].cur;
-            }
+            const u32 i = e.n & (S - 1);
             stg[p].r[i] = r;
             if (i == S - 1) {
-                R* d = c - (S - 1);
-#ifdef __AVX512F__
-                for (int k = 0; k < S / 2; k++)
-                    _mm512_stream_si512((__m512i*)(d + 2 * k), _mm512_load_si512((const void*)&stg[p].r[2 * k]));
-#else
-                for (int k = 0; k < S; k++)
-                    _mm256_stream_si256((__m256i*)(d + k), _mm256_load_si256((const __m256i*)&stg[p].r[k]));
-#endif
+                char* d = (char*)(e.base + e.n - (S - 1));
+                const char* src = (const char*)&stg[p];
+                // 256-bit stores: 512-bit instructions lower the clock on the scorer's CPUs
+                for (int k = 0; k < 2 * LINES; k++)
+                    _mm256_stream_si256((__m256i*)(d + 32 * k), _mm256_load_si256((const __m256i*)(src + 32 * k)));
             }
-            ce[p].cur = c + 1;
+            e.n++;
             return;
         }
-        R* c = ce[p].cur;
-        if (__builtin_expect(c == ce[p].end, 0)) {
-            grow(p);
-            c = ce[p].cur;
-        }
+        R* c = e.base + e.n;
         // the block's next lines are written soon: prefetch them for ownership
         // (thousands of scattered streams defeat the hardware prefetcher)
         __builtin_prefetch((const char*)c + 192, 1, 3);
         *c = r;
-        ce[p].cur = c + 1;
+        e.n++;
     }
     void finish() {
         if constexpr (NT) {
-            // a staged first half whose line was never streamed
+            // a staged partial group whose lines were never streamed
             for (int p = 0; p < np; p++) {
-                R* c = ce[p].cur;
-                const u32 i = (u32)((uintptr_t)c >> 5) & (S - 1);
-                for (u32 k = 0; k < i; k++) c[(int)k - (int)i] = stg[p].r[k];
+                const CE& e = ce[p];
+                const u32 i = e.n & (S - 1);
+                for (u32 k = 0; k < i; k++) e.base[e.n - i + k] = stg[p].r[k];
             }
             _mm_sfence();
         }
         for (int p = 0; p < np; p++)
-            if (tail[p]) tail[p]->n = (u32)(ce[p].cur - bdata<R>(tail[p]));
+            if (tail[p]) tail[p]->n = ce[p].n;
     }
 };
 template <class R>
@@ -1617,6 +1618,15 @@ static inline u32 ctz128(u128 x) {
     const u64 lo = (u64)x;
     return lo ? (u32)__builtin_ctzll(lo) : 64 + (u32)__builtin_ctzll((u64)(x >> 64));
 }
+// Prefix XOR (bit i = parity of bits 0..i). The AVX-512 build does it with one
+// carry-less multiply by all ones; every CPU with AVX-512 has PCLMULQDQ.
+#ifdef __AVX512BW__
+#define SS_SCAN_TARGET __attribute__((target("pclmul")))
+SS_SCAN_TARGET __attribute__((always_inline)) static inline u64 pxor64(u64 v) {
+    return (u64)_mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128((long long)v), _mm_set1_epi8((char)0xFF), 0));
+}
+#else
+#define SS_SCAN_TARGET
 static inline u64 pxor64(u64 v) {
     v ^= v << 1;
     v ^= v << 2;
@@ -1626,8 +1636,18 @@ static inline u64 pxor64(u64 v) {
     v ^= v << 32;
     return v;
 }
+#endif
+static inline u64 pxor64_ref(u64 v) {
+    v ^= v << 1;
+    v ^= v << 2;
+    v ^= v << 4;
+    v ^= v << 8;
+    v ^= v << 16;
+    v ^= v << 32;
+    return v;
+}
 template <class G>
-__attribute__((flatten)) static void for_lines7(const Task& t, G&& g) {
+SS_SCAN_TARGET __attribute__((flatten)) static void for_lines7(const Task& t, G&& g) {
     const char* b = t.b;
     const char* bufend = b + t.size;
     size_t pos = first_line(t);
@@ -1711,7 +1731,7 @@ __attribute__((flatten)) static void for_lines7(const Task& t, G&& g) {
 // Short lines (clicks, links): the same idea as for_lines7 with a 64-byte
 // window. Lines of 64+ bytes or near the buffer end take the general path.
 template <int NF, class G>
-__attribute__((flatten)) static void for_lines_short(const Task& t, G&& g) {
+SS_SCAN_TARGET __attribute__((flatten)) static void for_lines_short(const Task& t, G&& g) {
     const char* b = t.b;
     const char* bufend = b + t.size;
     size_t pos = first_line(t);
@@ -1782,17 +1802,25 @@ static inline u64 load8(const char* p) {
 }
 
 // One well-formed event line (field bounds fs/fe) -> r; false if event_id is empty.
-__attribute__((always_inline)) static inline bool parse_event(const char* p, const u32* fs, const u32* fe,
-                                                               const char* bufend, EvRec& r) {
+// Returns 0 if event_id is empty, else 1, or 2 for a valid purchase (aux set).
+__attribute__((always_inline)) static inline int parse_event(const char* p, const u32* fs, const u32* fe,
+                                                              const char* bufend, EvRec& r, u32& aux) {
     u32 l0 = fe[0] - fs[0];
-    if (!l0) return false;
+    if (!l0) return 0;
     r.eid = key_of_fast(p + fs[0], l0, bufend);
     i64 ing;
-    if (!parse_ts_fast(p + fs[3], fe[3] - fs[3], ing)) ing = INT64_MAX;
-    r.ingest = ing;
+    if (parse_ts_fast(p + fs[3], fe[3] - fs[3], ing)) {
+        const i64 sec = ing / 1000 - IBASE_S;
+        if (__builtin_expect(ing % 1000 != 0 || sec < 0 || sec >= (i64)NO_ING, 0))
+            NEED_GENERIC.store(true, memory_order_relaxed);
+        r.ing = (u32)sec;
+    } else {
+        ing = INT64_MAX;
+        r.ing = NO_ING;
+    }
     r.user = 0;
     r.ts = BAD_TS;
-    r.aux = 0;
+    int ret = 1;
     do {
         u32 l1 = fe[1] - fs[1];
         if (!l1) break;
@@ -1829,16 +1857,18 @@ __attribute__((always_inline)) static inline bool parse_event(const char* p, con
                 const KV* pe = pk ? PRODUCTS.get(pk) : nullptr;
                 cat = (u32)(pe ? pe->v : (u64)UNKNOWN_CAT);
             }
-            r.aux = price | (cat << 24);
+            aux = price | (cat << 24);
+            ret = 2;
         }
     } while (0);
-    return true;
+    return ret;
 }
 
 // ---- per-thread state -----------------------------------------------------------
 struct Thr {
     Slab slab;
     Scatter<EvRec> se;
+    Scatter<PurRec> sq;  // valid purchases, by the same event partitions
     Scatter<CRec> sc;
     Scatter<PRec> sp;
     // pass 3 outputs
@@ -1857,6 +1887,7 @@ static void run() {
     const int NCAMP = (int)CAMP_ID.size();
     const int NCAT = (int)CATNAMES.size();
     CBASE = WS - WEEK_MS;
+    IBASE_S = floordiv(CBASE, 1000) - ((i64)1 << 31);
     DAYBASE = (u64)(CBASE - DAY0 * DAY_MS + 4 * WEEK_MS) ;  // shifted to stay non-negative
     // day index = (ts + DAYBASE) / DAY_MS - 28 (the 4-week shift)
     const u64 est_events = EV_BYTES / 85 + 1;
@@ -1875,10 +1906,14 @@ static void run() {
 
     vector<Thr> th(NT);
     for (auto& t : th) {
-        t.se.init(NPE, &t.slab, 512);
-        static_assert(sizeof(EvRec) * 512 == sizeof(PRec) * 1024, "recycled event blocks must fit person blocks");
-        t.sc.init(NPP, &t.slab, 256);
-        t.sp.init(NPP, &t.slab, 1024);
+        const u32 EB = getenv("SS_EBLK") ? (u32)atoi(getenv("SS_EBLK")) : 512;
+        t.se.init(NPE, &t.slab, EB);
+        t.sq.init(NPE, &t.slab, getenv("SS_QBLK") ? (u32)atoi(getenv("SS_QBLK")) : 64);
+        // person blocks are the size of event blocks, so dead event blocks are recycled
+        static_assert(2 * sizeof(EvRec) == 3 * sizeof(PRec), "recycled event blocks must fit person blocks");
+        if (EB % 2) die("SS_EBLK");
+        t.sp.init(NPP, &t.slab, EB / 2 * 3);
+        t.sc.init(NPP, &t.slab, getenv("SS_CBLK") ? (u32)atoi(getenv("SS_CBLK")) : 256);
     }
     // ---- links build on their own thread, overlapped with the parse -------------
     static atomic<bool> links_ready(false);
@@ -1902,11 +1937,18 @@ static void run() {
             Thr& T = th[tid];
             if (t.kind == 0) {
                 Scatter<EvRec>& se = T.se;
+                Scatter<PurRec>& sq = T.sq;
                 const int sh = 64 - PE_BITS;
                 for_lines7(t, [&](const char* p, const u32* fs, const u32* fe) {
-                    EvRec r;
-                    if (!parse_event(p, fs, fe, bufend, r)) return;
-                    se.push((int)(mix64(r.eid) >> sh), r);
+                    PurRec r;
+                    const int k = parse_event(p, fs, fe, bufend, r.e, r.aux);
+                    if (!k) return;
+                    const int part = (int)(mix64(r.e.eid) >> sh);
+                    if (__builtin_expect(k == 2, 0)) {
+                        r.pad = 0;
+                        sq.push(part, r);
+                    } else
+                        se.push(part, r.e);
                 });
                 _mm_sfence();  // this thread's non-temporal stores are globally visible before the join
             } else {
@@ -1951,11 +1993,19 @@ static void run() {
                 flush();
             }
         });
-        for (auto& t : th) t.se.finish();
+        for (auto& t : th) t.se.finish(), t.sq.finish();
         tick("parse events+clicks");
+        if (getenv("SS_STOP_PARSE")) _exit(0);  // benchmarking aid: time the parse phase alone
     }
     links_thread.join();
     tick("links joined");
+    if (NEED_GENERIC.load() || getenv("SS_FORCE_GENERIC_AFTER_PARSE")) {
+        // an ingest_ts the compact event record cannot hold: start over with
+        // the plain implementation (nothing has been written yet)
+        tick("fast path gave up: generic");
+        generic::run();
+        return;
+    }
 
     // ---- pass 2: dedup events, map to persons ---------------------------------------
     {
@@ -1963,13 +2013,33 @@ static void run() {
         ses.reserve(NT);
         for (auto& t : th) ses.push_back(t.se);
         vector<vector<EvRec>> bufs(NT);
+        vector<vector<u32>> auxs(NT);
         vector<vector<u32>> tabs(NT);
         vector<vector<u8>> wins(NT);
         vector<vector<u32>> survs(NT);
         par_for(NPE, [&](int p, int tid) {
             auto& buf = bufs[tid];
             size_t n = gather(ses, p, buf);
+            // then the valid purchases: records [nmain, n), their aux in A[i - nmain]
+            const size_t nmain = n;
+            {
+                size_t nq = 0;
+                for (auto& t : th)
+                    for (Blk* b = t.sq.head[p]; b; b = b->next) nq += b->n;
+                if (buf.size() < n + nq) buf.resize(n + nq + (n + nq) / 4 + 16);
+                auto& av = auxs[tid];
+                if (av.size() < nq) av.resize(nq + nq / 4 + 16);
+                EvRec* o = buf.data() + n;
+                u32* ao = av.data();
+                for (auto& t : th)
+                    for (Blk* b = t.sq.head[p]; b; b = b->next) {
+                        const PurRec* r = bdata<PurRec>(b);
+                        for (u32 k = 0; k < b->n; k++) *o++ = r[k].e, *ao++ = r[k].aux;
+                    }
+                n += nq;
+            }
             if (!n) return;
+            const u32* A = auxs[tid].data();
             for (auto& sv : ses)  // these event blocks are dead now: reuse them for person records
                 for (Blk* b = sv.head[p]; b;) {
                     Blk* nx = b->next;
@@ -1997,7 +2067,7 @@ static void run() {
                         break;
                     }
                     if (E[x - 1].eid == k) {
-                        if (E[i].ingest < E[x - 1].ingest) {
+                        if (E[i].ing < E[x - 1].ing) {
                             W[x - 1] = 0;
                             tab[s] = i + 1;
                         } else
@@ -2023,11 +2093,12 @@ static void run() {
             for (u32 i = 0; i < ns && i < D; i++) person_prefetch(E[S[i]].user);
             for (u32 i = 0; i < ns; i++) {
                 if (i + D < ns) person_prefetch(E[S[i + D]].user);
-                const EvRec& r = E[S[i]];
+                const u32 x = S[i];
+                const EvRec& r = E[x];
                 PRec q;
                 q.person = person_of(r.user);
                 q.ts = r.ts;
-                q.aux = r.aux;
+                q.aux = x >= nmain ? A[x - nmain] : 0;
                 sp.push((int)(mix64(q.person) >> sh), q);
             }
         });
@@ -2528,6 +2599,92 @@ static void build_links() {
         if (T[s].k) T[s].v = pv[T[s].v];
 }
 
+// Line scanners against for_lines + split<NF> on random dirty CSV text, with
+// random task bounds: the same lines, the same fields, the same quote stripping.
+SS_SCAN_TARGET static u64 pxor64_call(u64 v) { return fast::pxor64(v); }
+static long selftest_lines() {
+    u64 seed = 0x2545F4914F6CDD1DULL;
+    auto rnd = [&]() {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        return seed;
+    };
+    long bad = 0;
+    for (int it = 0; it < 200000; it++) {
+        const u64 v = rnd() & (rnd() | rnd());
+        if (pxor64_call(v) != fast::pxor64_ref(v) && bad++ < 5) fprintf(stderr, "pxor mismatch\n");
+    }
+    const char chars[] = "ab0Z_ \r\"\",,,,\n";
+    string text;
+    vector<pair<size_t, vector<pair<u32, u32>>>> want, got;
+    for (int it = 0; it < 3000; it++) {
+        const int NFs[3] = {7, 4, 2};
+        const int NF = NFs[it % 3];
+        text = "h,e,a,d\n";
+        const int nlines = 1 + (int)(rnd() % 300);
+        for (int l = 0; l < nlines; l++) {
+            const u32 kind = (u32)(rnd() % 16);
+            if (kind == 0) {  // random bytes
+                const u32 n = (u32)(rnd() % 150);
+                for (u32 i = 0; i < n; i++) text.push_back(chars[rnd() % (sizeof(chars) - 1)]);
+                text.push_back('\n');
+                continue;
+            }
+            const int nf = kind == 1 ? (int)(rnd() % 10) : NF;
+            const int flen = kind == 2 ? 40 : (kind == 3 ? 2 : 12);
+            for (int f = 0; f < nf; f++) {
+                if (f) text.push_back(',');
+                const u32 q = (u32)(rnd() % 8);
+                if (q == 0) text.push_back('"');
+                const u32 n = (u32)(rnd() % (u64)(flen + 1));
+                for (u32 i = 0; i < n; i++) {
+                    const u32 r = (u32)(rnd() % 64);
+                    text.push_back(r == 0 ? '"' : r == 1 ? '\r' : r == 2 ? ' ' : (char)('a' + rnd() % 26));
+                }
+                if (q == 0 || (q == 1 && rnd() % 4 == 0)) text.push_back('"');
+            }
+            if (rnd() % 64 || l + 1 < nlines) text.push_back('\n');
+        }
+        // the text sits in a buffer of exactly its size, so the scanners'
+        // end-of-buffer paths are exercised (ASan-style: nothing may read past it)
+        vector<char> buf(text.begin(), text.end());
+        const char* b = buf.data();
+        const size_t n = buf.size();
+        size_t cut1 = rnd() % (n + 1), cut2 = rnd() % (n + 1);
+        if (cut1 > cut2) swap(cut1, cut2);
+        const size_t cuts[4] = {0, cut1, cut2, n};
+        want.clear();
+        got.clear();
+        for (int c = 0; c < 3; c++) {
+            Task t{b, n, cuts[c], cuts[c + 1], 0};
+            if (t.begin == t.end) continue;
+            for_lines(t, [&](const char* ls, const char* le) {
+                const char* fs[8];
+                u32 fl[8];
+                bool ok = NF == 7 ? split<7>(ls, le, fs, fl) : NF == 4 ? split<4>(ls, le, fs, fl) : split<2>(ls, le, fs, fl);
+                if (!ok) return;
+                vector<pair<u32, u32>> v;
+                for (int f = 0; f < NF; f++) v.push_back({(u32)(fs[f] - b), fl[f]});
+                want.push_back({(size_t)(ls - b), v});
+            });
+            auto g = [&](const char* p, const u32* fs, const u32* fe) {
+                vector<pair<u32, u32>> v;
+                for (int f = 0; f < NF; f++) v.push_back({(u32)(p - b) + fs[f], fe[f] - fs[f]});
+                got.push_back({(size_t)(p - b), v});
+            };
+            if (NF == 7)
+                fast::for_lines7(t, g);
+            else if (NF == 4)
+                fast::for_lines_short<4>(t, g);
+            else
+                fast::for_lines_short<2>(t, g);
+        }
+        if (want != got && bad++ < 5) fprintf(stderr, "line scan mismatch (NF=%d, %zu vs %zu lines)\n", NF, want.size(), got.size());
+    }
+    return bad;
+}
+
 // SS_SELFTEST=1: differential tests of the fast helpers against the plain ones.
 static int selftest() {
     u64 seed = 88172645463325252ULL;
@@ -2608,6 +2765,7 @@ static int selftest() {
             }
         }
     }
+    bad += selftest_lines();
     fprintf(stderr, "selftest: %ld mismatches\n", bad);
     return bad ? 1 : 0;
 }
