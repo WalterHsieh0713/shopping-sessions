@@ -1408,7 +1408,7 @@ static void* slab_alloc(Slab& s, size_t n) {
     return r;
 }
 #ifndef SS_STG
-#define SS_STG 4
+#define SS_STG 2
 #endif
 struct alignas(32 * SS_STG < 64 ? 64 : 32 * SS_STG) Blk {  // block data aligned to a whole staging buffer
     Blk* next;
@@ -1637,7 +1637,10 @@ __attribute__((flatten)) static void for_lines7(const Task& t, G&& g) {
         const char* p = b + pos;
         __builtin_prefetch(p + 8192);  // the input a few pages ahead: page cache pages are 4 KB, past the reach of the hardware prefetcher
         if (__builtin_expect(p + 128 <= bufend, 1)) {
-#ifdef __AVX512BW__
+#ifndef SS_YES512
+#define SS_NO512
+#endif
+#if defined(__AVX512BW__) && !defined(SS_NO512)
             const __m512i w0 = _mm512_loadu_si512((const void*)p);
             const __m512i w1 = _mm512_loadu_si512((const void*)(p + 64));
 #define SS_MASK64(a, c0, c1) ((u64)_mm512_cmpeq_epi8_mask(c0, _mm512_broadcast_i64x4(a)))
@@ -1687,7 +1690,7 @@ __attribute__((flatten)) static void for_lines7(const Task& t, G&& g) {
                     }
                 }
 #undef SS_MASK64
-#ifdef __AVX512BW__
+#if defined(__AVX512BW__) && !defined(SS_NO512)
 #undef v0
 #undef v1
 #undef v2
@@ -1718,7 +1721,7 @@ __attribute__((flatten)) static void for_lines_short(const Task& t, G&& g) {
         const char* p = b + pos;
         __builtin_prefetch(p + 4096);
         if (__builtin_expect(p + 64 <= bufend, 1)) {
-#ifdef __AVX512BW__
+#if defined(__AVX512BW__) && !defined(SS_NO512)
             const __m512i w0 = _mm512_loadu_si512((const void*)p);
 #define SS_MASK64(a, c0, c1) ((u64)_mm512_cmpeq_epi8_mask(w0, _mm512_broadcast_i64x4(a)))
 #else
